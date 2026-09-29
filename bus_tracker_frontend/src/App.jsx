@@ -8,9 +8,13 @@ import {
   useMap,
 } from "react-leaflet";
 import L from "leaflet";
+import markerIcon from "leaflet/dist/images/marker-icon.png";
+import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
+import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import "leaflet/dist/leaflet.css";
 
-const API_BASE_URL = "http://localhost:8080";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL?.trim() || "http://localhost:8080";
 
 const LOCATIONS_URL = `${API_BASE_URL}/get-locations`;
 const ROUTES_URL = `${API_BASE_URL}/routes`;
@@ -32,11 +36,16 @@ const REQUEST_TIMEOUT = 5000;
  */
 const ACTIVE_THRESHOLD_SECONDS = 15;
 const STALE_THRESHOLD_SECONDS = 60;
+const MAX_FUTURE_TIMESTAMP_SECONDS = 30;
+const CONNECTION_STALE_THRESHOLD_MS =
+  REQUEST_TIMEOUT + POLLING_INTERVAL;
+const CONNECTION_OFFLINE_THRESHOLD_MS =
+  CONNECTION_STALE_THRESHOLD_MS * 2;
 
 const vehicleIcon = new L.Icon({
-  iconUrl: "/marker-icon.png",
-  iconRetinaUrl: "/marker-icon-2x.png",
-  shadowUrl: "/marker-shadow.png",
+  iconUrl: markerIcon,
+  iconRetinaUrl: markerIcon2x,
+  shadowUrl: markerShadow,
   iconSize: [25, 41],
   iconAnchor: [12, 41],
   popupAnchor: [1, -34],
@@ -51,30 +60,23 @@ const vehicleIcon = new L.Icon({
  */
 
 function formatTimeAgo(timestamp, now) {
-  if (!timestamp) {
+  const ageSeconds = getTimestampAgeSeconds(timestamp, now);
+
+  if (ageSeconds === null) {
     return "Unknown";
   }
 
-  const parsed = new Date(timestamp).getTime();
+  const wholeAgeSeconds = Math.floor(ageSeconds);
 
-  if (!Number.isFinite(parsed)) {
-    return "Unknown";
-  }
-
-  const ageSeconds = Math.max(
-    0,
-    Math.floor((now - parsed) / 1000)
-  );
-
-  if (ageSeconds < 5) {
+  if (wholeAgeSeconds < 5) {
     return "Just now";
   }
 
-  if (ageSeconds < 60) {
-    return `${ageSeconds}s ago`;
+  if (wholeAgeSeconds < 60) {
+    return `${wholeAgeSeconds}s ago`;
   }
 
-  const minutes = Math.floor(ageSeconds / 60);
+  const minutes = Math.floor(wholeAgeSeconds / 60);
 
   if (minutes < 60) {
     return `${minutes}m ago`;
@@ -92,21 +94,33 @@ function formatTimeAgo(timestamp, now) {
 }
 
 
-function getVehicleStatus(timestamp, now) {
+function getTimestampAgeSeconds(timestamp, now) {
   if (!timestamp) {
-    return "Unknown";
+    return null;
   }
 
   const parsed = new Date(timestamp).getTime();
 
   if (!Number.isFinite(parsed)) {
-    return "Unknown";
+    return null;
   }
 
-  const ageSeconds = Math.max(
-    0,
-    (now - parsed) / 1000
-  );
+  const ageSeconds = (now - parsed) / 1000;
+
+  if (ageSeconds < -MAX_FUTURE_TIMESTAMP_SECONDS) {
+    return null;
+  }
+
+  return Math.max(0, ageSeconds);
+}
+
+
+function getVehicleStatus(timestamp, now) {
+  const ageSeconds = getTimestampAgeSeconds(timestamp, now);
+
+  if (ageSeconds === null) {
+    return "Unknown";
+  }
 
   if (ageSeconds <= ACTIVE_THRESHOLD_SECONDS) {
     return "Active";
@@ -117,6 +131,32 @@ function getVehicleStatus(timestamp, now) {
   }
 
   return "Offline";
+}
+
+
+function getDisplayConnectionState(
+  connectionState,
+  lastSuccessfulSync,
+  now
+) {
+  if (!lastSuccessfulSync) {
+    return connectionState;
+  }
+
+  const syncAge = now - lastSuccessfulSync;
+
+  if (syncAge > CONNECTION_OFFLINE_THRESHOLD_MS) {
+    return "offline";
+  }
+
+  if (
+    syncAge > CONNECTION_STALE_THRESHOLD_MS ||
+    connectionState === "offline"
+  ) {
+    return "reconnecting";
+  }
+
+  return "live";
 }
 
 
@@ -136,6 +176,10 @@ function getStatusColor(status) {
   }
 }
 
+
+function normalizeRouteKey(value) {
+  return String(value ?? "").trim().toUpperCase();
+}
 
 function haversineDistanceKm(
   latitude1,
@@ -236,6 +280,11 @@ function calculateApproximateEtaMinutes(
 }
 
 
+function markProgrammaticMove(ref, durationMs = 1200) {
+  ref.current = Math.max(ref.current, Date.now() + durationMs);
+}
+
+
 /*
  * =========================================================
  * RouteCenter
@@ -249,65 +298,75 @@ function calculateApproximateEtaMinutes(
  */
 function RouteCenter({
   vehicles,
+  stops,
   searchRequestId,
   disabled,
+  programmaticMoveRef,
 }) {
   const map = useMap();
-
   const lastHandledRequest = useRef(0);
 
   useEffect(() => {
-    if (disabled) {
+    if (disabled || searchRequestId === 0) {
       return;
     }
 
-    if (searchRequestId === 0) {
+    if (lastHandledRequest.current === searchRequestId) {
       return;
     }
 
-    if (
-      lastHandledRequest.current ===
-      searchRequestId
-    ) {
-      return;
-    }
-
-    if (vehicles.length === 0) {
-      return;
-    }
-
-    const bounds = vehicles
+    const vehicleCoords = vehicles
       .map((vehicle) => [
         Number(vehicle.latitude),
         Number(vehicle.longitude),
       ])
       .filter(
         ([latitude, longitude]) =>
-          Number.isFinite(latitude) &&
-          Number.isFinite(longitude)
+          Number.isFinite(latitude) && Number.isFinite(longitude)
       );
 
-    if (bounds.length === 0) {
+    const stopCoords = stops
+      .map((stop) => [
+        Number(stop.latitude),
+        Number(stop.longitude),
+      ])
+      .filter(
+        ([latitude, longitude]) =>
+          Number.isFinite(latitude) && Number.isFinite(longitude)
+      );
+
+    const coords = [
+      ...vehicleCoords,
+      ...stopCoords,
+    ];
+
+    if (coords.length === 0) {
       return;
     }
 
-    map.fitBounds(bounds, {
-      padding: [50, 50],
-      maxZoom: 15,
-      animate: true,
-    });
+    markProgrammaticMove(programmaticMoveRef);
 
-    lastHandledRequest.current =
-      searchRequestId;
-  }, [
-    vehicles,
-    searchRequestId,
-    disabled,
-    map,
-  ]);
+    if (coords.length === 1) {
+      map.setView(
+        coords[0],
+        Math.max(map.getZoom(), FOLLOW_ZOOM),
+        { animate: true }
+      );
+    } else {
+      map.fitBounds(coords, {
+        padding: [50, 50],
+        maxZoom: 15,
+        animate: true,
+      });
+    }
+
+    lastHandledRequest.current = searchRequestId;
+  }, [vehicles, stops, searchRequestId, disabled, map, programmaticMoveRef]);
 
   return null;
 }
+
+
 
 
 /*
@@ -331,24 +390,18 @@ function FollowVehicle({
   vehicle,
   enabled,
   onFollowingChange,
+  programmaticMoveRef,
 }) {
   const map = useMap();
-
   const vehicleId = vehicle?.vehicle_id;
 
   const previousVehicleId = useRef(null);
   const previousEnabled = useRef(enabled);
-
   const userInteracting = useRef(false);
-  const programmaticMove = useRef(false);
 
-
-  /*
-   * Detect manual map interaction.
-   */
   useEffect(() => {
     const handleInteractionStart = () => {
-      if (programmaticMove.current) {
+      if (Date.now() < programmaticMoveRef.current) {
         return;
       }
 
@@ -363,119 +416,60 @@ function FollowVehicle({
     map.on("zoomstart", handleInteractionStart);
 
     return () => {
-      map.off(
-        "dragstart",
-        handleInteractionStart
-      );
-
-      map.off(
-        "zoomstart",
-        handleInteractionStart
-      );
+      map.off("dragstart", handleInteractionStart);
+      map.off("zoomstart", handleInteractionStart);
     };
-  }, [
-    map,
-    enabled,
-    onFollowingChange,
-  ]);
+  }, [map, enabled, onFollowingChange, programmaticMoveRef]);
 
-
-  /*
-   * Handle location changes.
-   *
-   * A vehicle ID change means a new vehicle was selected.
-   * We intentionally skip that update so selection itself
-   * cannot move the map.
-   */
   useEffect(() => {
-    if (!vehicleId || !enabled) {
-      previousVehicleId.current =
-        vehicleId || null;
-
-      previousEnabled.current =
-        enabled;
-
+    if (!vehicleId) {
+      previousVehicleId.current = null;
+      previousEnabled.current = enabled;
       return;
     }
 
-    /*
-     * New vehicle selected.
-     *
-     * Preserve the current map position.
-     */
-    if (
-      previousVehicleId.current !==
-      vehicleId
-    ) {
-      previousVehicleId.current =
-        vehicleId;
+    if (!enabled) {
+      previousVehicleId.current = vehicleId;
+      previousEnabled.current = false;
+      return;
+    }
 
-      previousEnabled.current =
-        enabled;
+    const vehicleChanged = previousVehicleId.current !== vehicleId;
+    const followingResumed =
+      previousVehicleId.current === vehicleId &&
+      previousEnabled.current === false;
 
+    previousVehicleId.current = vehicleId;
+    previousEnabled.current = true;
+
+    // Selecting a vehicle preserves the current map position.
+    if (vehicleChanged) {
       userInteracting.current = false;
-
       return;
     }
 
-    /*
-     * Following was just resumed.
-     *
-     * Preserve the current map position here as well.
-     * The next telemetry update will move the map.
-     */
-    if (
-      !previousEnabled.current &&
-      enabled
-    ) {
-      previousEnabled.current =
-        enabled;
-
+    // Resuming following immediately recenters, even if the vehicle is stopped.
+    if (followingResumed) {
       userInteracting.current = false;
+    }
 
+    if (userInteracting.current && !followingResumed) {
       return;
     }
 
-    previousEnabled.current =
-      enabled;
+    const latitude = Number(vehicle.latitude);
+    const longitude = Number(vehicle.longitude);
 
-    if (userInteracting.current) {
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
       return;
     }
 
-    const latitude = Number(
-      vehicle.latitude
-    );
+    markProgrammaticMove(programmaticMoveRef);
 
-    const longitude = Number(
-      vehicle.longitude
-    );
-
-    if (
-      !Number.isFinite(latitude) ||
-      !Number.isFinite(longitude)
-    ) {
-      return;
-    }
-
-    programmaticMove.current = true;
-
-    map.panTo(
-      [latitude, longitude],
-      {
-        animate: true,
-        duration: 0.8,
-      }
-    );
-
-    const resetTimer = setTimeout(() => {
-      programmaticMove.current =
-        false;
-    }, 1000);
-
-    return () => {
-      clearTimeout(resetTimer);
-    };
+    map.panTo([latitude, longitude], {
+      animate: true,
+      duration: 0.8,
+    });
   }, [
     vehicle?.latitude,
     vehicle?.longitude,
@@ -483,28 +477,21 @@ function FollowVehicle({
     vehicleId,
     enabled,
     map,
+    programmaticMoveRef,
   ]);
 
-
-  /*
-   * Reset manual interaction state when the vehicle is
-   * completely deselected.
-   */
   useEffect(() => {
     if (!vehicleId) {
-      previousVehicleId.current =
-        null;
-
-      previousEnabled.current =
-        enabled;
-
-      userInteracting.current =
-        false;
+      previousVehicleId.current = null;
+      previousEnabled.current = false;
+      userInteracting.current = false;
     }
-  }, [vehicleId, enabled]);
+  }, [vehicleId]);
 
   return null;
 }
+
+
 
 
 /*
@@ -520,76 +507,122 @@ function FollowVehicle({
 function MapController({
   selectedVehicle,
   vehicles,
+  stops,
   recenterRequestId,
+  programmaticMoveRef,
 }) {
   const map = useMap();
-
   const lastHandledRequest = useRef(0);
 
   useEffect(() => {
     if (
       recenterRequestId === 0 ||
-      lastHandledRequest.current ===
-        recenterRequestId
+      lastHandledRequest.current === recenterRequestId
     ) {
       return;
     }
 
-    lastHandledRequest.current =
-      recenterRequestId;
+    lastHandledRequest.current = recenterRequestId;
 
     if (selectedVehicle) {
-      const latitude = Number(
-        selectedVehicle.latitude
-      );
+      const latitude = Number(selectedVehicle.latitude);
+      const longitude = Number(selectedVehicle.longitude);
 
-      const longitude = Number(
-        selectedVehicle.longitude
-      );
+      if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+        markProgrammaticMove(programmaticMoveRef);
 
-      if (
-        Number.isFinite(latitude) &&
-        Number.isFinite(longitude)
-      ) {
         map.setView(
           [latitude, longitude],
-          Math.max(
-            map.getZoom(),
-            FOLLOW_ZOOM
-          ),
-          {
-            animate: true,
-          }
+          Math.max(map.getZoom(), FOLLOW_ZOOM),
+          { animate: true }
         );
+
+        lastHandledRequest.current = recenterRequestId;
       }
 
       return;
     }
 
-    const bounds = vehicles
+    const vehicleCoords = vehicles
       .map((vehicle) => [
         Number(vehicle.latitude),
         Number(vehicle.longitude),
       ])
       .filter(
         ([latitude, longitude]) =>
-          Number.isFinite(latitude) &&
-          Number.isFinite(longitude)
+          Number.isFinite(latitude) && Number.isFinite(longitude)
       );
 
-    if (bounds.length > 0) {
-      map.fitBounds(bounds, {
+    const stopCoords = stops
+      .map((stop) => [
+        Number(stop.latitude),
+        Number(stop.longitude),
+      ])
+      .filter(
+        ([latitude, longitude]) =>
+          Number.isFinite(latitude) && Number.isFinite(longitude)
+      );
+
+    const coords =
+      vehicleCoords.length > 0 ? vehicleCoords : stopCoords;
+
+    if (coords.length === 0) {
+      return;
+    }
+
+    markProgrammaticMove(programmaticMoveRef);
+
+    if (coords.length === 1) {
+      map.setView(
+        coords[0],
+        Math.max(map.getZoom(), FOLLOW_ZOOM),
+        { animate: true }
+      );
+    } else {
+      map.fitBounds(coords, {
         padding: [50, 50],
         maxZoom: 15,
         animate: true,
       });
     }
+
+    lastHandledRequest.current = recenterRequestId;
   }, [
     recenterRequestId,
     selectedVehicle,
     vehicles,
+    stops,
     map,
+    programmaticMoveRef,
   ]);
+
+  return null;
+}
+
+
+
+
+function FocusStop({ stop, programmaticMoveRef }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!stop) {
+      return;
+    }
+
+    const latitude = Number(stop.latitude);
+    const longitude = Number(stop.longitude);
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return;
+    }
+
+    markProgrammaticMove(programmaticMoveRef);
+    map.panTo([latitude, longitude], {
+      animate: true,
+      duration: 0.8,
+    });
+  }, [stop, map, programmaticMoveRef]);
 
   return null;
 }
@@ -662,10 +695,16 @@ export default function App() {
     setSelectedVehicleId,
   ] = useState("");
 
+  const selectedVehicleIdRef =
+    useRef("");
+
   const [
     selectedStop,
     setSelectedStop,
   ] = useState(null);
+
+  const [routePanelOpen, setRoutePanelOpen] =
+    useState(true);
 
   const [stops, setStops] =
     useState([]);
@@ -706,9 +745,12 @@ export default function App() {
    * vehicle freshness stay current.
    */
   const [now, setNow] =
-    useState(Date.now());
+    useState(() => Date.now());
 
   const consecutiveFailures =
+    useRef(0);
+
+  const programmaticMoveRef =
     useRef(0);
 
 
@@ -796,122 +838,100 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     let timerId = null;
+    let pollAbortController = null;
 
-    const fetchLocations =
-      async () => {
-        try {
-          const response =
-            await fetch(
-              LOCATIONS_URL,
-              {
-                signal:
-                  AbortSignal.timeout(
-                    REQUEST_TIMEOUT
-                  ),
-              }
-            );
+    const fetchLocations = async () => {
+      pollAbortController = new AbortController();
+      let timedOut = false;
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        pollAbortController?.abort();
+      }, REQUEST_TIMEOUT);
 
-          if (!response.ok) {
-            throw new Error(
-              `Server returned HTTP ${response.status}`
-            );
-          }
+      try {
+        const response = await fetch(LOCATIONS_URL, {
+          signal: pollAbortController.signal,
+        });
 
-          const data =
-            await response.json();
-
-          if (!Array.isArray(data)) {
-            throw new Error(
-              "Invalid location data received from server."
-            );
-          }
-
-          if (cancelled) {
-            return;
-          }
-
-          setVehicles(data);
-
-          setError(null);
-
-          setConnectionState(
-            "live"
-          );
-
-          setLastSuccessfulSync(
-            Date.now()
-          );
-
-          consecutiveFailures.current =
-            0;
-        } catch (err) {
-          if (cancelled) {
-            return;
-          }
-
-          consecutiveFailures.current +=
-            1;
-
-          if (
-            consecutiveFailures.current >=
-            3
-          ) {
-            setConnectionState(
-              "offline"
-            );
-          } else {
-            setConnectionState(
-              "reconnecting"
-            );
-          }
-
-          if (
-            err?.name ===
-            "TimeoutError"
-          ) {
-            setError(
-              "Vehicle location request timed out."
-            );
-          } else if (
-            err?.name ===
-            "AbortError"
-          ) {
-            setError(
-              "Vehicle location request was cancelled."
-            );
-          } else {
-            setError(
-              err?.message ||
-                "Unable to fetch vehicle locations."
-            );
-          }
-        } finally {
-          if (cancelled) {
-            return;
-          }
-
-          setLocationsLoading(
-            false
-          );
-
-          timerId = setTimeout(
-            fetchLocations,
-            POLLING_INTERVAL
-          );
+        if (!response.ok) {
+          throw new Error(`Server returned HTTP ${response.status}`);
         }
-      };
+
+        const data = await response.json();
+
+        if (!Array.isArray(data)) {
+          throw new Error("Invalid location data received from server.");
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        const selectedId =
+          selectedVehicleIdRef.current;
+
+        if (
+          selectedId &&
+          !data.some(
+            (vehicle) =>
+              String(vehicle.vehicle_id) ===
+              String(selectedId)
+          )
+        ) {
+          selectedVehicleIdRef.current = "";
+          setSelectedVehicleId("");
+          setFollowingVehicle(false);
+        }
+
+        setVehicles(data);
+        setError(null);
+        setConnectionState("live");
+        setLastSuccessfulSync(Date.now());
+        consecutiveFailures.current = 0;
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+
+        consecutiveFailures.current += 1;
+
+        if (consecutiveFailures.current >= 3) {
+          setConnectionState("offline");
+        } else {
+          setConnectionState("reconnecting");
+        }
+
+        if (timedOut) {
+          setError("Vehicle location request timed out.");
+        } else if (err?.name === "AbortError") {
+          setError("Vehicle location request was cancelled.");
+        } else {
+          setError(err?.message || "Unable to fetch vehicle locations.");
+        }
+      } finally {
+        clearTimeout(timeoutId);
+
+        if (!cancelled) {
+          setLocationsLoading(false);
+          timerId = setTimeout(fetchLocations, POLLING_INTERVAL);
+        }
+      }
+    };
 
     fetchLocations();
 
     return () => {
       cancelled = true;
 
+      if (pollAbortController) {
+        pollAbortController.abort();
+      }
+
       if (timerId) {
         clearTimeout(timerId);
       }
     };
   }, []);
-
 
   /*
    * =======================================================
@@ -920,11 +940,6 @@ export default function App() {
    */
   useEffect(() => {
     if (!searchRoute) {
-      setStops([]);
-      setSelectedStop(null);
-      setStopError(null);
-      setStopsLoading(false);
-
       return;
     }
 
@@ -1020,8 +1035,8 @@ export default function App() {
   const selectedRoute =
     routes.find(
       (route) =>
-        route.route_id?.toLowerCase() ===
-        searchRoute.toLowerCase()
+        normalizeRouteKey(route.route_id) ===
+        normalizeRouteKey(searchRoute)
     ) || null;
 
 
@@ -1034,8 +1049,8 @@ export default function App() {
     searchRoute
       ? vehicles.filter(
           (vehicle) =>
-            vehicle.route_id?.toLowerCase() ===
-            searchRoute.toLowerCase()
+            normalizeRouteKey(vehicle.route_id) ===
+            normalizeRouteKey(searchRoute)
         )
       : vehicles;
 
@@ -1048,8 +1063,8 @@ export default function App() {
   const selectedVehicle =
     filteredVehicles.find(
       (vehicle) =>
-        vehicle.vehicle_id ===
-        selectedVehicleId
+        String(vehicle.vehicle_id) ===
+        String(selectedVehicleId)
     ) || null;
 
 
@@ -1058,10 +1073,7 @@ export default function App() {
    * Visible vehicles
    * =======================================================
    */
-  const visibleVehicles =
-    selectedVehicle
-      ? [selectedVehicle]
-      : filteredVehicles;
+  const visibleVehicles = vehicles;
 
 
   /*
@@ -1078,32 +1090,8 @@ export default function App() {
     );
 
 
-  /*
-   * =======================================================
-   * Clear selected vehicle when it disappears
-   * =======================================================
-   */
-  useEffect(() => {
-    if (!selectedVehicleId) {
-      return;
-    }
-
-    const stillExists =
-      filteredVehicles.some(
-        (vehicle) =>
-          vehicle.vehicle_id ===
-          selectedVehicleId
-      );
-
-    if (!stillExists) {
-      setSelectedVehicleId("");
-      setFollowingVehicle(true);
-    }
-  }, [
-    filteredVehicles,
-    selectedVehicleId,
-  ]);
-
+  const selectedVehicleIdForRender =
+    selectedVehicle ? selectedVehicleId : "";
 
   /*
    * =======================================================
@@ -1117,26 +1105,24 @@ export default function App() {
       const normalizedRoute =
         routeId.trim();
 
+      selectedVehicleIdRef.current = "";
       setSelectedVehicleId("");
       setSelectedStop(null);
+      setStops([]);
+      setStopError(null);
       setFollowingVehicle(true);
 
-      /*
-       * Explicit route searches are the only action that can
-       * trigger RouteCenter.
-       */
-      setSearchRequestId(
-        (current) => current + 1
-      );
-
       if (!normalizedRoute) {
+        setStopsLoading(false);
         setSearchRoute("");
         return;
       }
 
-      setSearchRoute(
-        normalizedRoute
+      setSearchRequestId(
+        (current) => current + 1
       );
+
+      setSearchRoute(normalizedRoute);
     };
 
 
@@ -1148,10 +1134,12 @@ export default function App() {
   const clearSearch = () => {
     setRouteId("");
     setSearchRoute("");
+    selectedVehicleIdRef.current = "";
     setSelectedVehicleId("");
     setSelectedStop(null);
     setStops([]);
     setStopError(null);
+    setStopsLoading(false);
     setFollowingVehicle(true);
 
     /*
@@ -1169,6 +1157,7 @@ export default function App() {
    */
   const selectVehicle =
     (vehicleId) => {
+      selectedVehicleIdRef.current = vehicleId;
       setSelectedVehicleId(
         vehicleId
       );
@@ -1194,8 +1183,8 @@ export default function App() {
    * Select stop
    * =======================================================
    *
-   * Stop selection only highlights the stop.
-   * It does not move the map.
+   * Stop selection highlights the stop, closes the panel,
+   * and FocusStop moves the map to it.
    */
   const selectStop = (stopId) => {
     if (!stopId) {
@@ -1206,12 +1195,11 @@ export default function App() {
     const stop =
       stops.find(
         (item) =>
-          item.stop_id === stopId
+          String(item.stop_id) ===
+          String(stopId)
       );
 
-    setSelectedStop(
-      stop || null
-    );
+    setSelectedStop(stop || null);
   };
 
 
@@ -1229,9 +1217,7 @@ export default function App() {
    * =======================================================
    */
   const toggleFollowing = () => {
-    setFollowingVehicle(
-      (current) => !current
-    );
+    setFollowingVehicle((current) => !current);
   };
 
 
@@ -1281,12 +1267,20 @@ export default function App() {
 
   const etaData =
     selectedVehicle &&
-    selectedStop
+    selectedStop &&
+    (selectedVehicleStatus === "Active" ||
+      selectedVehicleStatus === "Stale")
       ? calculateApproximateEtaMinutes(
           selectedVehicle,
           selectedStop
         )
       : null;
+
+  const etaUnavailableMessage =
+    selectedVehicleStatus === "Offline" ||
+    selectedVehicleStatus === "Unknown"
+      ? "ETA unavailable because the vehicle data is not current."
+      : "ETA unavailable while the vehicle is stationary or its speed is unavailable.";
 
 
   /*
@@ -1294,14 +1288,21 @@ export default function App() {
    * Connection label
    * =======================================================
    */
+  const displayConnectionState =
+    getDisplayConnectionState(
+      connectionState,
+      lastSuccessfulSync,
+      now
+    );
+
   const connectionLabel =
-    connectionState ===
+    displayConnectionState ===
     "live"
       ? "Live"
-      : connectionState ===
+      : displayConnectionState ===
         "reconnecting"
       ? "Reconnecting"
-      : connectionState ===
+      : displayConnectionState ===
         "offline"
       ? "Connection lost"
       : "Connecting";
@@ -1397,6 +1398,28 @@ export default function App() {
           .map-panel h3 {
             margin: 0 0 10px;
             font-size: 15px;
+          }
+
+          .map-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 10px;
+          }
+
+          .map-panel-header h3 {
+            margin: 0;
+          }
+
+          .panel-toggle {
+            padding: 5px 8px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            background: #ffffff;
+            cursor: pointer;
+            font-size: 12px;
+            white-space: nowrap;
           }
 
           .vehicle-card {
@@ -1600,9 +1623,10 @@ export default function App() {
               left: 10px;
               right: 10px;
               top: auto;
-              bottom: 10px;
+              top: 10px;
+              bottom: auto;
               width: auto;
-              max-height: 46%;
+              max-height: 42%;
             }
 
             .info-panel {
@@ -1671,7 +1695,7 @@ export default function App() {
 
         {searchRoute && (
           <select
-            value={selectedVehicleId}
+            value={selectedVehicleIdForRender}
             onChange={
               handleVehicleSelection
             }
@@ -1747,7 +1771,7 @@ export default function App() {
 
         <div className="connection-indicator">
           <span
-            className={`connection-dot ${connectionState}`}
+            className={`connection-dot ${displayConnectionState}`}
           />
           <span>
             {connectionLabel}
@@ -1793,40 +1817,33 @@ export default function App() {
 
 
           <RouteCenter
-            vehicles={visibleVehicles}
-            searchRequestId={
-              searchRequestId
-            }
-            disabled={Boolean(
-              selectedVehicle
-            )}
+            vehicles={filteredVehicles}
+            stops={sortedStops}
+            searchRequestId={searchRequestId}
+            disabled={Boolean(selectedVehicle)}
+            programmaticMoveRef={programmaticMoveRef}
           />
 
 
           <MapController
-            selectedVehicle={
-              selectedVehicle
-            }
+            selectedVehicle={selectedVehicle}
             vehicles={visibleVehicles}
-            recenterRequestId={
-              recenterRequestId
-            }
+            stops={sortedStops}
+            recenterRequestId={recenterRequestId}
+            programmaticMoveRef={programmaticMoveRef}
           />
 
 
           <FollowVehicle
-            vehicle={
-              selectedVehicle
-            }
-            enabled={
-              Boolean(
-                selectedVehicle
-              ) &&
-              followingVehicle
-            }
-            onFollowingChange={
-              setFollowingVehicle
-            }
+            vehicle={selectedVehicle}
+            enabled={Boolean(selectedVehicle) && followingVehicle}
+            onFollowingChange={setFollowingVehicle}
+            programmaticMoveRef={programmaticMoveRef}
+          />
+
+          <FocusStop
+            stop={selectedStop}
+            programmaticMoveRef={programmaticMoveRef}
           />
 
 
@@ -1860,8 +1877,8 @@ export default function App() {
                 );
 
               const isSelected =
-                vehicle.vehicle_id ===
-                selectedVehicleId;
+                String(vehicle.vehicle_id) ===
+                String(selectedVehicleId);
 
               const vehicleSpeed =
                 Number(
@@ -1979,47 +1996,43 @@ export default function App() {
           )}
 
 
-          {selectedStop && (
-            <CircleMarker
-              key={
-                selectedStop.stop_id
-              }
-              center={[
-                Number(
-                  selectedStop.latitude
-                ),
-                Number(
-                  selectedStop.longitude
-                ),
-              ]}
-              radius={10}
-              pathOptions={{
-                weight: 3,
-              }}
-            >
-              <Popup>
-                <div>
-                  <strong>
-                    {
-                      selectedStop.stop_name
-                    }
-                  </strong>
+          {sortedStops.map((stop) => {
+            const latitude = Number(stop.latitude);
+            const longitude = Number(stop.longitude);
 
-                  <div
-                    style={{
-                      marginTop:
-                        "5px",
-                    }}
-                  >
-                    Stop{" "}
-                    {
-                      selectedStop.sequence
-                    }
+            if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+              return null;
+            }
+
+            const isSelected =
+              String(selectedStop?.stop_id) === String(stop.stop_id);
+
+            return (
+              <CircleMarker
+                key={stop.stop_id}
+                center={[latitude, longitude]}
+                radius={isSelected ? 10 : 6}
+                pathOptions={{
+                  color: isSelected ? "#0070f3" : "#555555",
+                  fillColor: isSelected ? "#3291ff" : "#aaaaaa",
+                  fillOpacity: isSelected ? 0.9 : 0.6,
+                  weight: isSelected ? 3 : 1,
+                }}
+                eventHandlers={{
+                  click: () => selectStop(stop.stop_id),
+                }}
+              >
+                <Popup>
+                  <div>
+                    <strong>{stop.stop_name}</strong>
+                    <div style={{ marginTop: "5px" }}>
+                      Stop {stop.sequence}
+                    </div>
                   </div>
-                </div>
-              </Popup>
-            </CircleMarker>
-          )}
+                </Popup>
+              </CircleMarker>
+            );
+          })}
         </MapContainer>
 
 
@@ -2028,11 +2041,32 @@ export default function App() {
            ================================================= */}
         {searchRoute && (
           <div className="map-panel">
-            <h3>
-              {selectedRoute
-                ? selectedRoute.route_name
-                : searchRoute}
-            </h3>
+            <div className="map-panel-header">
+              <h3>
+                {selectedRoute
+                  ? selectedRoute.route_name
+                  : searchRoute}
+              </h3>
+
+              <button
+                type="button"
+                className="panel-toggle"
+                onClick={() =>
+                  setRoutePanelOpen((current) => !current)
+                }
+                aria-expanded={routePanelOpen}
+                aria-label={
+                  routePanelOpen
+                    ? "Collapse route panel"
+                    : "Expand route panel"
+                }
+              >
+                {routePanelOpen ? "Hide" : "Show"}
+              </button>
+            </div>
+
+            {routePanelOpen && (
+              <>
 
             <div
               style={{
@@ -2122,8 +2156,8 @@ export default function App() {
                         );
 
                       const isSelected =
-                        vehicle.vehicle_id ===
-                        selectedVehicleId;
+                        String(vehicle.vehicle_id) ===
+                        String(selectedVehicleId);
 
                       return (
                         <div
@@ -2225,8 +2259,8 @@ export default function App() {
                   {sortedStops.map(
                     (stop) => {
                       const isSelected =
-                        selectedStop?.stop_id ===
-                        stop.stop_id;
+                        String(selectedStop?.stop_id) ===
+                        String(stop.stop_id);
 
                       return (
                         <button
@@ -2317,6 +2351,8 @@ export default function App() {
                   }
                 </div>
               </div>
+            )}
+              </>
             )}
           </div>
         )}
@@ -2486,12 +2522,25 @@ export default function App() {
                         "#666",
                     }}
                   >
-                    ETA unavailable
-                    while the
-                    vehicle is
-                    stationary.
+                    {etaUnavailableMessage}
                   </div>
                 )}
+
+                {etaData &&
+                  selectedVehicleStatus === "Stale" && (
+                    <div
+                      style={{
+                        fontSize:
+                          "12px",
+                        color:
+                          "#a15c00",
+                        marginTop:
+                          "6px",
+                      }}
+                    >
+                      Vehicle data is stale; this estimate may be outdated.
+                    </div>
+                  )}
 
                 <div
                   style={{
