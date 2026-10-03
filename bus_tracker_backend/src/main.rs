@@ -1,15 +1,29 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     routing::{get, post, put},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
+use uuid::Uuid;
 
 mod db;
-use db::{CurrentVehicleState, Database, LocationWriteError, StoreError};
+use db::{AdminVehicle, CurrentVehicleState, Database, LocationWriteError, StoreError};
+
+#[cfg(test)]
+mod tests;
 
 // ========================================================
 // Configuration / safety limits
@@ -115,6 +129,46 @@ struct UpdateStopRequest {
     sequence: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateVehicleRequest {
+    vehicle_id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateVehicleRequest {
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignRouteRequest {
+    route_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDeviceRequest {
+    device_label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimDeviceRequest {
+    pairing_code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceEnrollmentResponse {
+    device_id: Uuid,
+    pairing_code: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceClaimResponse {
+    device_id: Uuid,
+    credential_id: Uuid,
+    credential: String,
+}
+
 // ========================================================
 // Application state
 // ========================================================
@@ -122,6 +176,42 @@ struct UpdateStopRequest {
 #[derive(Clone)]
 struct AppState {
     database: Database,
+    rate_limiter: RateLimiter,
+}
+
+#[derive(Clone, Default)]
+struct RateLimiter {
+    buckets: Arc<Mutex<HashMap<(IpAddr, &'static str), RateWindow>>>,
+}
+
+struct RateWindow {
+    started_at: Instant,
+    requests: u32,
+}
+
+impl RateLimiter {
+    async fn allow(&self, remote_ip: IpAddr, category: &'static str, limit: u32) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().await;
+        buckets.retain(|_, bucket| now.duration_since(bucket.started_at) < Duration::from_secs(60));
+        let key = (remote_ip, category);
+        if !buckets.contains_key(&key) && buckets.len() >= 10_000 {
+            return false;
+        }
+        let bucket = buckets.entry(key).or_insert(RateWindow {
+            started_at: now,
+            requests: 0,
+        });
+        if now.duration_since(bucket.started_at) >= Duration::from_secs(60) {
+            bucket.started_at = now;
+            bucket.requests = 0;
+        }
+        if bucket.requests >= limit {
+            return false;
+        }
+        bucket.requests += 1;
+        true
+    }
 }
 
 // ========================================================
@@ -132,7 +222,10 @@ struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
     let database = Database::connect(&database_url).await?;
-    let state = AppState { database };
+    let state = AppState {
+        database,
+        rate_limiter: RateLimiter::default(),
+    };
 
     // ----------------------------------------------------
     // Build router
@@ -157,6 +250,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/admin/routes/{route_id}",
             put(update_route).delete(delete_route),
         )
+        .route("/admin/vehicles", get(get_vehicles).post(create_vehicle))
+        .route(
+            "/admin/vehicles/{vehicle_id}",
+            get(get_vehicle).patch(update_vehicle),
+        )
+        .route(
+            "/admin/vehicles/{vehicle_id}/devices",
+            post(create_device_enrollment),
+        )
+        .route(
+            "/admin/vehicles/{vehicle_id}/route-assignments",
+            post(assign_vehicle_route),
+        )
+        .route("/admin/devices/{device_id}/revoke", post(revoke_device))
+        .route("/devices/claim", post(claim_device))
         // ============================
         // Admin stop endpoints
         // ============================
@@ -180,7 +288,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🚀 Server running on http://localhost:8080");
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -191,77 +303,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn update_location(
     State(state): State<AppState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<LocationUpdate>,
 ) -> Result<&'static str, (StatusCode, &'static str)> {
-    let vehicle_id = payload.vehicle_id.trim().to_uppercase();
-
-    let route_id = payload.route_id.trim().to_uppercase();
-
-    // ----------------------------------------------------
-    // Validate IDs
-    // ----------------------------------------------------
-
-    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
-        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
-    }
-
-    if route_id.is_empty() || route_id.len() > 64 {
-        return Err((StatusCode::BAD_REQUEST, "Invalid route ID"));
-    }
-
-    // ----------------------------------------------------
-    // Validate coordinates
-    // ----------------------------------------------------
-
-    if !payload.latitude.is_finite()
-        || !payload.longitude.is_finite()
-        || !(-90.0..=90.0).contains(&payload.latitude)
-        || !(-180.0..=180.0).contains(&payload.longitude)
+    if !state
+        .rate_limiter
+        .allow(remote.ip(), "telemetry", 120)
+        .await
     {
-        return Err((StatusCode::BAD_REQUEST, "Invalid coordinates"));
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests"));
     }
-
-    // ----------------------------------------------------
-    // Server-authoritative time + device clock guard
-    // ----------------------------------------------------
-
+    let (credential_id, secret_hash) = parse_device_credential(&headers)?;
+    let vehicle_id = payload.vehicle_id.trim().to_uppercase();
+    let route_id = payload.route_id.trim().to_uppercase();
     let server_timestamp = Utc::now();
-    let latest_allowed_device_time =
-        server_timestamp + chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS);
-
-    if payload.device_timestamp > latest_allowed_device_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Device timestamp is too far in the future",
-        ));
-    }
-
-    let earliest_allowed_device_time =
-        server_timestamp - chrono::Duration::seconds(MAX_PAST_DEVICE_TIMESTAMP_AGE_SECONDS);
-
-    if payload.device_timestamp < earliest_allowed_device_time {
-        return Err((StatusCode::BAD_REQUEST, "Device timestamp is too old"));
-    }
 
     match state
         .database
         .record_location(
+            credential_id,
+            &secret_hash,
             &vehicle_id,
             &route_id,
             payload.latitude,
             payload.longitude,
             payload.device_timestamp,
             server_timestamp,
-            |previous| calculate_speed(previous, &route_id, &payload),
+            |previous| {
+                validate_location_update(&vehicle_id, &route_id, &payload, server_timestamp)?;
+                calculate_speed(previous, &route_id, &payload)
+            },
         )
         .await
     {
         Ok(true) => Ok("Location updated"),
         Ok(false) => Ok("Duplicate update ignored"),
         Err(LocationWriteError::Domain(error)) => Err(error),
-        Err(LocationWriteError::RouteNotFound) => {
-            Err((StatusCode::BAD_REQUEST, "Route does not exist"))
+        Err(LocationWriteError::Unauthorized) => {
+            Err((StatusCode::UNAUTHORIZED, "Invalid device credentials"))
         }
+        Err(LocationWriteError::RouteAssignmentMismatch) => Err((
+            StatusCode::FORBIDDEN,
+            "Vehicle is not assigned to this route",
+        )),
         Err(LocationWriteError::Capacity) => Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Active vehicle limit reached",
@@ -271,6 +356,41 @@ async fn update_location(
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
         }
     }
+}
+
+fn validate_location_update(
+    vehicle_id: &str,
+    route_id: &str,
+    payload: &LocationUpdate,
+    server_timestamp: DateTime<Utc>,
+) -> Result<(), (StatusCode, &'static str)> {
+    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
+    }
+    if route_id.is_empty() || route_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid route ID"));
+    }
+    if !payload.latitude.is_finite()
+        || !payload.longitude.is_finite()
+        || !(-90.0..=90.0).contains(&payload.latitude)
+        || !(-180.0..=180.0).contains(&payload.longitude)
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid coordinates"));
+    }
+    let latest_allowed_device_time =
+        server_timestamp + chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS);
+    if payload.device_timestamp > latest_allowed_device_time {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Device timestamp is too far in the future",
+        ));
+    }
+    let earliest_allowed_device_time =
+        server_timestamp - chrono::Duration::seconds(MAX_PAST_DEVICE_TIMESTAMP_AGE_SECONDS);
+    if payload.device_timestamp < earliest_allowed_device_time {
+        return Err((StatusCode::BAD_REQUEST, "Device timestamp is too old"));
+    }
+    Ok(())
 }
 
 fn calculate_speed(
@@ -384,6 +504,283 @@ async fn get_route_stops(
         })?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn create_vehicle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateVehicleRequest>,
+) -> Result<(StatusCode, Json<AdminVehicle>), (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = payload.vehicle_id.trim().to_uppercase();
+    let display_name = payload.display_name.map(|name| name.trim().to_string());
+
+    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
+    }
+    if display_name
+        .as_ref()
+        .is_some_and(|name| name.is_empty() || name.len() > 128)
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle name"));
+    }
+    let display_name = display_name.filter(|name| !name.is_empty());
+
+    match state
+        .database
+        .register_vehicle(&vehicle_id, display_name.as_deref())
+        .await
+    {
+        Ok(vehicle) => Ok((StatusCode::CREATED, Json(vehicle))),
+        Err(StoreError::Conflict) => Err((StatusCode::CONFLICT, "Vehicle already exists")),
+        Err(StoreError::Database(error)) => {
+            eprintln!("Vehicle registration failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
+async fn get_vehicles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AdminVehicle>>, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    state
+        .database
+        .admin_vehicles()
+        .await
+        .map(Json)
+        .map_err(|error| {
+            eprintln!("Vehicle list query failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+        })
+}
+
+async fn get_vehicle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vehicle_id): Path<String>,
+) -> Result<Json<AdminVehicle>, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = vehicle_id.trim().to_uppercase();
+    match state.database.admin_vehicle(&vehicle_id).await {
+        Ok(Some(vehicle)) => Ok(Json(vehicle)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "Vehicle does not exist")),
+        Err(error) => {
+            eprintln!("Vehicle query failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
+    }
+}
+
+async fn update_vehicle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vehicle_id): Path<String>,
+    Json(payload): Json<UpdateVehicleRequest>,
+) -> Result<Json<AdminVehicle>, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = vehicle_id.trim().to_uppercase();
+    let status = payload.status.trim().to_lowercase();
+    if !matches!(
+        status.as_str(),
+        "pending" | "active" | "deactivated" | "retired"
+    ) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle status"));
+    }
+
+    match state
+        .database
+        .update_vehicle(&vehicle_id, &status, None)
+        .await
+    {
+        Ok(vehicle) => Ok(Json(vehicle)),
+        Err(StoreError::VehicleNotFound) => Err((StatusCode::NOT_FOUND, "Vehicle does not exist")),
+        Err(StoreError::Database(error)) => {
+            eprintln!("Vehicle update failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
+async fn assign_vehicle_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vehicle_id): Path<String>,
+    Json(payload): Json<AssignRouteRequest>,
+) -> Result<Json<AdminVehicle>, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = vehicle_id.trim().to_uppercase();
+    let route_id = payload.route_id.trim().to_uppercase();
+    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
+    }
+    if route_id.is_empty() || route_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid route ID"));
+    }
+    match state.database.assign_route(&vehicle_id, &route_id).await {
+        Ok(()) => match state.database.admin_vehicle(&vehicle_id).await {
+            Ok(Some(vehicle)) => Ok(Json(vehicle)),
+            Ok(None) => Err((StatusCode::NOT_FOUND, "Vehicle does not exist")),
+            Err(error) => {
+                eprintln!("Vehicle assignment query failed: {error}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+            }
+        },
+        Err(StoreError::VehicleNotFound) => Err((StatusCode::NOT_FOUND, "Vehicle does not exist")),
+        Err(StoreError::InvalidVehicleStatus) => Err((
+            StatusCode::CONFLICT,
+            "Vehicle is not available for assignment",
+        )),
+        Err(StoreError::RouteNotFound) => Err((StatusCode::NOT_FOUND, "Route does not exist")),
+        Err(StoreError::Database(error)) => {
+            eprintln!("Vehicle route assignment failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
+async fn create_device_enrollment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vehicle_id): Path<String>,
+    Json(payload): Json<CreateDeviceRequest>,
+) -> Result<(StatusCode, Json<DeviceEnrollmentResponse>), (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = vehicle_id.trim().to_uppercase();
+    let device_label = payload.device_label.trim();
+    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
+    }
+    if device_label.is_empty() || device_label.len() > 128 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid device label"));
+    }
+
+    let pairing_bytes = generate_random_secret().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Credential generation failed",
+        )
+    })?;
+    let pairing_code = URL_SAFE_NO_PAD.encode(pairing_bytes);
+    let pairing_code_hash = hash_secret(&pairing_bytes);
+    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+    let device_id = match state
+        .database
+        .create_device_enrollment(&vehicle_id, device_label, &pairing_code_hash, expires_at)
+        .await
+    {
+        Ok(device_id) => device_id,
+        Err(StoreError::VehicleNotFound) => {
+            return Err((StatusCode::NOT_FOUND, "Vehicle does not exist"));
+        }
+        Err(StoreError::InvalidVehicleStatus) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Vehicle is not available for enrollment",
+            ));
+        }
+        Err(StoreError::DeviceAlreadyActive) => {
+            return Err((StatusCode::CONFLICT, "Device enrollment already pending"));
+        }
+        Err(StoreError::Database(error)) => {
+            eprintln!("Device enrollment failed: {error}");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"));
+        }
+        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(DeviceEnrollmentResponse {
+            device_id,
+            pairing_code,
+            expires_at,
+        }),
+    ))
+}
+
+async fn claim_device(
+    State(state): State<AppState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Json(payload): Json<ClaimDeviceRequest>,
+) -> Result<Json<DeviceClaimResponse>, (StatusCode, &'static str)> {
+    if !state
+        .rate_limiter
+        .allow(remote.ip(), "device_claim", 10)
+        .await
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests"));
+    }
+    let pairing_bytes = URL_SAFE_NO_PAD
+        .decode(payload.pairing_code.trim())
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or((StatusCode::UNAUTHORIZED, "Invalid or expired pairing code"))?;
+    let pairing_code_hash = hash_secret(&pairing_bytes);
+
+    let secret_bytes = generate_random_secret().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Credential generation failed",
+        )
+    })?;
+    let secret_hash = hash_secret(&secret_bytes);
+    let credential_id = Uuid::new_v4();
+
+    let device_id = match state
+        .database
+        .claim_device(&pairing_code_hash, credential_id, &secret_hash)
+        .await
+    {
+        Ok(device_id) => device_id,
+        Err(StoreError::PairingInvalid | StoreError::DeviceAlreadyActive) => {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid or expired pairing code"));
+        }
+        Err(StoreError::Database(error)) => {
+            eprintln!("Device claim failed: {error}");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"));
+        }
+        Err(_) => return Err((StatusCode::UNAUTHORIZED, "Invalid or expired pairing code")),
+    };
+
+    Ok(Json(DeviceClaimResponse {
+        device_id,
+        credential_id,
+        credential: format!("{credential_id}.{}", URL_SAFE_NO_PAD.encode(secret_bytes)),
+    }))
+}
+
+async fn revoke_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let device_id = Uuid::parse_str(&device_id)
+        .map_err(|_| (StatusCode::NOT_FOUND, "Device does not exist"))?;
+    match state.database.revoke_device(device_id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(StoreError::VehicleNotFound) => Err((StatusCode::NOT_FOUND, "Device does not exist")),
+        Err(StoreError::Database(error)) => {
+            eprintln!("Device revocation failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
+fn generate_random_secret() -> Result<[u8; 32], rand::Error> {
+    let mut bytes = [0; 32];
+    OsRng.try_fill_bytes(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn hash_secret(secret: &[u8]) -> [u8; 32] {
+    Sha256::digest(secret).into()
 }
 
 // ========================================================
@@ -657,6 +1054,24 @@ fn authorize_admin(headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)
     }
 
     Ok(())
+}
+
+fn parse_device_credential(
+    headers: &HeaderMap,
+) -> Result<(Uuid, [u8; 32]), (StatusCode, &'static str)> {
+    let invalid = (StatusCode::UNAUTHORIZED, "Invalid device credentials");
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(invalid)?;
+    let (credential_id, secret) = token.split_once('.').ok_or(invalid)?;
+    let credential_id = Uuid::parse_str(credential_id).map_err(|_| invalid)?;
+    let secret = URL_SAFE_NO_PAD.decode(secret).map_err(|_| invalid)?;
+    if secret.len() != 32 {
+        return Err(invalid);
+    }
+    Ok((credential_id, hash_secret(&secret)))
 }
 
 fn build_cors_layer() -> CorsLayer {
