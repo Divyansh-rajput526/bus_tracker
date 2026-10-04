@@ -3,12 +3,19 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../config/api_config.dart';
+import '../models/assignment.dart';
 import '../models/device_session.dart';
 
+enum ApiFailureKind { network, invalidResponse, unexpectedResponse }
+
 class ApiException implements Exception {
-  const ApiException(this.message);
+  const ApiException(
+    this.message, {
+    this.kind = ApiFailureKind.unexpectedResponse,
+  });
 
   final String message;
+  final ApiFailureKind kind;
 
   @override
   String toString() => message;
@@ -25,6 +32,12 @@ class DeviceClaimException implements Exception {
   const DeviceClaimException(this.kind);
 
   final DeviceClaimFailureKind kind;
+}
+
+class DeviceAssignmentHttpException implements Exception {
+  const DeviceAssignmentHttpException(this.statusCode);
+
+  final int statusCode;
 }
 
 class ApiClient {
@@ -85,11 +98,41 @@ class ApiClient {
     }
   }
 
-  Future<http.Response> _get(String path) async {
+  Future<Assignment> getDeviceAssignment(DeviceSession session) async {
+    final response = await _get(
+      'devices/assignment',
+      headers: {'authorization': 'Bearer ${session.credential}'},
+    );
+    if (response.statusCode != 200) {
+      throw DeviceAssignmentHttpException(response.statusCode);
+    }
+
+    final decoded = _decodeJson(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw const ApiException(
+        'Backend returned an unexpected device assignment response.',
+      );
+    }
     try {
-      return await _client.get(_baseUri.resolve(path));
+      return Assignment.fromJson(decoded);
+    } on FormatException {
+      throw const ApiException(
+        'Backend returned an unexpected device assignment response.',
+      );
+    }
+  }
+
+  Future<http.Response> _get(
+    String path, {
+    Map<String, String>? headers,
+  }) async {
+    try {
+      return await _client.get(_baseUri.resolve(path), headers: headers);
     } on http.ClientException {
-      throw const ApiException('Could not connect to the backend.');
+      throw const ApiException(
+        'Could not connect to the backend.',
+        kind: ApiFailureKind.network,
+      );
     }
   }
 
@@ -109,7 +152,10 @@ class ApiClient {
     try {
       return jsonDecode(body);
     } on FormatException {
-      throw const ApiException('Backend returned invalid JSON.');
+      throw const ApiException(
+        'Backend returned invalid JSON.',
+        kind: ApiFailureKind.invalidResponse,
+      );
     }
   }
 

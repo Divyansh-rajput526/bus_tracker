@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 import 'data/api_client.dart';
 import 'data/device_session_store.dart';
 import 'models/device_session.dart';
+import 'screens/assignment_screen.dart';
 import 'screens/device_enrollment_screen.dart';
-import 'screens/status_screen.dart';
 
 void main() {
   runApp(const DriverApp());
@@ -118,7 +118,7 @@ class _DriverHomeState extends State<_DriverHome> {
         onEnrolled: _saveSession,
       );
     }
-    return StatusScreen(
+    return AssignmentScreen(
       apiClient: widget.apiClient,
       session: session,
       onClearSession: _clearSession,

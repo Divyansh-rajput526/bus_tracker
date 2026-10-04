@@ -20,7 +20,10 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 mod db;
-use db::{AdminVehicle, CurrentVehicleState, Database, LocationWriteError, StoreError};
+use db::{
+    AdminVehicle, CurrentVehicleState, Database, DeviceCredentialError, LocationWriteError,
+    StoreError,
+};
 
 #[cfg(test)]
 mod tests;
@@ -265,6 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/admin/devices/{device_id}/revoke", post(revoke_device))
         .route("/devices/claim", post(claim_device))
+        .route("/devices/assignment", get(get_device_assignment))
         // ============================
         // Admin stop endpoints
         // ============================
@@ -1016,6 +1020,27 @@ async fn delete_stop(
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
         }
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
+async fn get_device_assignment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<db::DeviceAssignment>, (StatusCode, &'static str)> {
+    let (credential_id, secret_hash) = parse_device_credential(&headers)?;
+    match state
+        .database
+        .device_assignment(credential_id, &secret_hash, Utc::now())
+        .await
+    {
+        Ok(assignment) => Ok(Json(assignment)),
+        Err(DeviceCredentialError::Unauthorized) => {
+            Err((StatusCode::UNAUTHORIZED, "Invalid device credentials"))
+        }
+        Err(DeviceCredentialError::Database(error)) => {
+            eprintln!("Device assignment query failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
     }
 }
 

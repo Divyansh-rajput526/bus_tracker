@@ -11,7 +11,7 @@ at build or run time:
 flutter run --dart-define=API_BASE_URL=https://your-api.example
 ```
 
-For the Android emulator, use `http://10.0.2.2:3000` to reach a backend running
+For the Android emulator, use `http://10.0.2.2:8080` to reach a backend running
 on the host machine. The initial screen checks `GET /routes`, the backend's
 public JSON endpoint. Device enrollment is initiated by an administrator; the
 driver app's claim client uses `POST /devices/claim` with a `pairing_code`.

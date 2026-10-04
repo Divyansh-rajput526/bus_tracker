@@ -44,6 +44,36 @@ pub struct AdminVehicle {
     pub active_device_count: i64,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct DeviceAssignment {
+    pub device_id: Uuid,
+    pub vehicle_id: Option<String>,
+    pub route_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum DeviceCredentialError {
+    Database(sqlx::Error),
+    Unauthorized,
+}
+
+fn device_credential_is_valid(
+    stored_secret_hash: &[u8],
+    revoked_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+    device_status: &str,
+    vehicle_status: &str,
+    provided_secret_hash: &[u8],
+    now: DateTime<Utc>,
+) -> bool {
+    let hash_matches: bool = stored_secret_hash.ct_eq(provided_secret_hash).into();
+    hash_matches
+        && revoked_at.is_none()
+        && expires_at.is_none_or(|expires_at| expires_at > now)
+        && device_status == "active"
+        && vehicle_status == "active"
+}
+
 impl From<sqlx::Error> for StoreError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error)
@@ -67,6 +97,63 @@ impl Database {
             .await?;
         sqlx::migrate!().run(&pool).await?;
         Ok(Self { pool })
+    }
+
+    pub async fn device_assignment(
+        &self,
+        credential_id: Uuid,
+        provided_secret_hash: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<DeviceAssignment, DeviceCredentialError> {
+        let credential = sqlx::query_as::<
+            _,
+            (
+                Vec<u8>,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
+                Uuid,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT credential.secret_hash, credential.revoked_at, credential.expires_at,
+                    device.device_pk, device.status, vehicle.status,
+                    CASE WHEN route.route_pk IS NULL THEN NULL ELSE vehicle.vehicle_id END,
+                    route.route_id
+             FROM device_credentials AS credential
+             JOIN tracking_devices AS device ON device.device_pk = credential.device_pk
+             JOIN vehicles AS vehicle ON vehicle.vehicle_pk = device.vehicle_pk
+             LEFT JOIN vehicle_route_assignments AS assignment
+               ON assignment.vehicle_pk = vehicle.vehicle_pk AND assignment.ended_at IS NULL
+             LEFT JOIN routes AS route
+               ON route.route_pk = assignment.route_pk AND route.deleted_at IS NULL
+             WHERE credential.credential_id = $1",
+        )
+        .bind(credential_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DeviceCredentialError::Database)?
+        .ok_or(DeviceCredentialError::Unauthorized)?;
+
+        if !device_credential_is_valid(
+            &credential.0,
+            credential.1,
+            credential.2,
+            &credential.4,
+            &credential.5,
+            provided_secret_hash,
+            now,
+        ) {
+            return Err(DeviceCredentialError::Unauthorized);
+        }
+
+        Ok(DeviceAssignment {
+            device_id: credential.3,
+            vehicle_id: credential.6,
+            route_id: credential.7,
+        })
     }
 
     #[cfg(test)]
@@ -122,15 +209,15 @@ impl Database {
         .await
         .map_err(LocationWriteError::Database)?
         .ok_or(LocationWriteError::Unauthorized)?;
-        let hash_matches: bool = credential.0.as_slice().ct_eq(provided_secret_hash).into();
-        if !hash_matches
-            || credential.1.is_some()
-            || credential
-                .2
-                .is_some_and(|expires_at| expires_at <= server_timestamp)
-            || credential.4 != "active"
-            || credential.7 != "active"
-        {
+        if !device_credential_is_valid(
+            &credential.0,
+            credential.1,
+            credential.2,
+            &credential.4,
+            &credential.7,
+            provided_secret_hash,
+            server_timestamp,
+        ) {
             return Err(LocationWriteError::Unauthorized);
         }
         if credential.6 != body_vehicle_id {

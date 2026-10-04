@@ -58,6 +58,16 @@ async fn issue_test_device(
     Ok((device_id, credential_id, credential_secret, credential_hash))
 }
 
+fn device_credential_headers(credential_id: Uuid, secret: &[u8]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let token = format!("{credential_id}.{}", URL_SAFE_NO_PAD.encode(secret));
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers
+}
+
 #[test]
 fn device_credential_parser_and_timestamp_validation() {
     let secret = [17_u8; 32];
@@ -238,6 +248,70 @@ async fn postgres_registration_authorization_and_telemetry_flow() {
         .await
         .unwrap();
 
+    let assignment = get_device_assignment(
+        State(AppState {
+            database: database.clone(),
+            rate_limiter: RateLimiter::default(),
+        }),
+        device_credential_headers(credential_id, &credential_secret),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        serde_json::to_value(assignment).unwrap(),
+        serde_json::json!({
+            "device_id": device_id,
+            "vehicle_id": "TEST-BUS-1",
+            "route_id": "R01"
+        })
+    );
+    assert_eq!(
+        get_device_assignment(
+            State(AppState {
+                database: database.clone(),
+                rate_limiter: RateLimiter::default(),
+            }),
+            device_credential_headers(Uuid::new_v4(), b"invalid credential"),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    database.register_vehicle("TEST-BUS-3", None).await.unwrap();
+    let (unassigned_device_id, unassigned_credential_id, unassigned_secret, _) = issue_test_device(
+        &database,
+        "TEST-BUS-3",
+        "unassigned device",
+        Utc::now() + chrono::Duration::minutes(10),
+    )
+    .await
+    .unwrap();
+    database
+        .update_vehicle("TEST-BUS-3", "active", None)
+        .await
+        .unwrap();
+    let assignment = get_device_assignment(
+        State(AppState {
+            database: database.clone(),
+            rate_limiter: RateLimiter::default(),
+        }),
+        device_credential_headers(unassigned_credential_id, &unassigned_secret),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        serde_json::to_value(assignment).unwrap(),
+        serde_json::json!({
+            "device_id": unassigned_device_id,
+            "vehicle_id": null,
+            "route_id": null
+        })
+    );
+
     let first_timestamp = Utc::now();
     let first = test_update("TEST-BUS-1", "R01", first_timestamp);
     assert!(
@@ -388,6 +462,19 @@ async fn postgres_registration_authorization_and_telemetry_flow() {
     assert_eq!(after_count, before_count);
 
     database.revoke_device(device_id).await.unwrap();
+    assert_eq!(
+        get_device_assignment(
+            State(AppState {
+                database: database.clone(),
+                rate_limiter: RateLimiter::default(),
+            }),
+            device_credential_headers(credential_id, &credential_secret),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
     assert!(matches!(
         write_update(
             &database,
