@@ -40,6 +40,12 @@ class DeviceAssignmentHttpException implements Exception {
   final int statusCode;
 }
 
+class DeviceTelemetryHttpException implements Exception {
+  const DeviceTelemetryHttpException(this.statusCode);
+
+  final int statusCode;
+}
+
 class ApiClient {
   ApiClient({http.Client? client, Uri? baseUri})
     : _client = client ?? http.Client(),
@@ -122,6 +128,33 @@ class ApiClient {
     }
   }
 
+  Future<void> sendLocationUpdate({
+    required DeviceSession session,
+    required String vehicleId,
+    required String routeId,
+    required double latitude,
+    required double longitude,
+    required DateTime deviceTimestamp,
+  }) async {
+    final response = await _post(
+      'update-location',
+      body: jsonEncode({
+        'vehicle_id': vehicleId,
+        'route_id': routeId,
+        'latitude': latitude,
+        'longitude': longitude,
+        'device_timestamp': deviceTimestamp.toUtc().toIso8601String(),
+      }),
+      headers: {
+        'authorization': 'Bearer ${session.credential}',
+        'content-type': 'application/json',
+      },
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw DeviceTelemetryHttpException(response.statusCode);
+    }
+  }
+
   Future<http.Response> _get(
     String path, {
     Map<String, String>? headers,
@@ -136,15 +169,22 @@ class ApiClient {
     }
   }
 
-  Future<http.Response> _post(String path, {required String body}) async {
+  Future<http.Response> _post(
+    String path, {
+    required String body,
+    Map<String, String>? headers,
+  }) async {
     try {
       return await _client.post(
         _baseUri.resolve(path),
-        headers: {'content-type': 'application/json'},
+        headers: headers ?? {'content-type': 'application/json'},
         body: body,
       );
     } on http.ClientException {
-      throw const ApiException('Could not connect to the backend.');
+      throw const ApiException(
+        'Could not connect to the backend.',
+        kind: ApiFailureKind.network,
+      );
     }
   }
 

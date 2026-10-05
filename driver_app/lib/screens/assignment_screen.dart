@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../data/api_client.dart';
+import '../data/foreground_location_service.dart';
 import '../models/assignment.dart';
 import '../models/device_session.dart';
+import 'location_screen.dart';
 
 enum _AssignmentViewState {
   loading,
@@ -20,11 +22,13 @@ class AssignmentScreen extends StatefulWidget {
     required this.session,
     required this.onClearSession,
     this.apiClient,
+    this.locationService,
   });
 
   final DeviceSession session;
   final Future<void> Function() onClearSession;
   final ApiClient? apiClient;
+  final ForegroundLocationService? locationService;
 
   @override
   State<AssignmentScreen> createState() => _AssignmentScreenState();
@@ -198,6 +202,21 @@ class _AssignmentScreenState extends State<AssignmentScreen> {
           value: assignment.routeId ?? 'No route assigned',
         ),
         const SizedBox(height: 32),
+        OutlinedButton.icon(
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => LocationScreen(
+                locationService: widget.locationService,
+                apiClient: _apiClient,
+                session: widget.session,
+                onUnauthorized: widget.onClearSession,
+              ),
+            ),
+          ),
+          icon: const Icon(Icons.my_location),
+          label: const Text('View GPS location'),
+        ),
+        const SizedBox(height: 12),
         OutlinedButton.icon(
           onPressed: _isClearing ? null : _confirmClearSession,
           icon: const Icon(Icons.delete_outline),
