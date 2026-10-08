@@ -17,6 +17,7 @@ import {
   formatVehicleSpeed,
   getDisplaySpeed,
 } from "./vehiclePresentation.js";
+import AdminDashboard from "./AdminDashboard.jsx";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL?.trim() || "http://localhost:8080";
@@ -570,6 +571,20 @@ function StatusBadge({ status }) {
  * =========================================================
  */
 export default function App() {
+  const [currentView, setCurrentView] = useState(() => {
+    return typeof window !== "undefined" && window.location.hash === "#admin"
+      ? "admin"
+      : "map";
+  });
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setCurrentView(window.location.hash === "#admin" ? "admin" : "map");
+    };
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
   const [vehicles, setVehicles] = useState([]);
 
   const [routes, setRoutes] = useState([]);
@@ -1212,16 +1227,17 @@ export default function App() {
    * =======================================================
    */
   return (
-    <div
-      style={{
-        width: "100vw",
-        height: "100vh",
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-        background: "#f5f6f8",
-      }}
-    >
+    <>
+      <div
+        style={{
+          width: "100vw",
+          height: "100vh",
+          display: currentView === "map" ? "flex" : "none",
+          flexDirection: "column",
+          overflow: "hidden",
+          background: "#f5f6f8",
+        }}
+      >
       <style>
         {`
           .top-control-panel {
@@ -1688,6 +1704,26 @@ export default function App() {
             )}
           </span>
         )}
+
+        <button
+          type="button"
+          onClick={() => {
+            window.location.hash = "#admin";
+            setCurrentView("admin");
+          }}
+          className="control-button"
+          style={{
+            marginLeft: "auto",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            fontWeight: 500,
+          }}
+          title="Open Admin Dashboard"
+        >
+          <span>⚙️</span>
+          <span>Admin</span>
+        </button>
       </div>
 
 
@@ -2478,5 +2514,16 @@ export default function App() {
           )}
       </div>
     </div>
+
+    {currentView === "admin" && (
+      <AdminDashboard
+        onBackToMap={() => {
+          window.location.hash = "";
+          setCurrentView("map");
+        }}
+        apiBaseUrl={API_BASE_URL}
+      />
+    )}
+  </>
   );
 }

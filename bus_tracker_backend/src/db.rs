@@ -60,6 +60,19 @@ pub struct AdminVehicle {
     pub active_device_count: i64,
 }
 
+#[derive(Debug, FromRow, serde::Serialize, Clone)]
+pub struct AdminDevice {
+    pub device_id: Uuid,
+    pub vehicle_id: String,
+    pub device_label: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub activated_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub pairing_expires_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct DeviceAssignment {
     pub device_id: Uuid,
@@ -807,6 +820,61 @@ impl Database {
             .ok_or(StoreError::VehicleNotFound)
     }
 
+    pub async fn delete_vehicle(&self, vehicle_id: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT vehicle_pk, status FROM vehicles WHERE vehicle_id = $1 FOR UPDATE",
+        )
+        .bind(vehicle_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::VehicleNotFound)?;
+
+        let vehicle_pk = existing.0;
+
+        // 1. Delete current tracking state for this vehicle
+        sqlx::query("DELETE FROM vehicle_current_state WHERE vehicle_pk = $1")
+            .bind(vehicle_pk)
+            .execute(&mut *tx)
+            .await?;
+
+        // 2. Delete telemetry records for this vehicle
+        sqlx::query("DELETE FROM vehicle_telemetry WHERE vehicle_pk = $1")
+            .bind(vehicle_pk)
+            .execute(&mut *tx)
+            .await?;
+
+        // 3. Delete route assignments for this vehicle
+        sqlx::query("DELETE FROM vehicle_route_assignments WHERE vehicle_pk = $1")
+            .bind(vehicle_pk)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Delete device credentials for tracking devices belonging to this vehicle
+        sqlx::query(
+            "DELETE FROM device_credentials
+             WHERE device_pk IN (SELECT device_pk FROM tracking_devices WHERE vehicle_pk = $1)",
+        )
+        .bind(vehicle_pk)
+        .execute(&mut *tx)
+        .await?;
+
+        // 5. Delete tracking devices for this vehicle
+        sqlx::query("DELETE FROM tracking_devices WHERE vehicle_pk = $1")
+            .bind(vehicle_pk)
+            .execute(&mut *tx)
+            .await?;
+
+        // 6. Delete the vehicle record itself
+        sqlx::query("DELETE FROM vehicles WHERE vehicle_pk = $1")
+            .bind(vehicle_pk)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn create_device_enrollment(
         &self,
         vehicle_id: &str,
@@ -859,6 +927,56 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(device_pk)
+    }
+
+    pub async fn vehicle_devices(
+        &self,
+        vehicle_id: &str,
+    ) -> Result<Option<Vec<AdminDevice>>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let vehicle = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT vehicle_pk, vehicle_id FROM vehicles WHERE vehicle_id = $1",
+        )
+        .bind(vehicle_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(vehicle) = vehicle else {
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "UPDATE tracking_devices
+             SET status = 'revoked', revoked_at = clock_timestamp(),
+                 pairing_code_hash = NULL, pairing_expires_at = NULL
+             WHERE vehicle_pk = $1 AND status = 'pending'
+               AND pairing_expires_at <= clock_timestamp()",
+        )
+        .bind(vehicle.0)
+        .execute(&mut *tx)
+        .await?;
+
+        let devices = sqlx::query_as::<_, AdminDevice>(
+            "SELECT device.device_pk AS device_id,
+                    vehicle.vehicle_id,
+                    device.device_label,
+                    device.status,
+                    device.created_at,
+                    device.activated_at,
+                    device.revoked_at,
+                    device.last_seen_at,
+                    device.pairing_expires_at
+             FROM tracking_devices AS device
+             JOIN vehicles AS vehicle ON vehicle.vehicle_pk = device.vehicle_pk
+             WHERE vehicle.vehicle_pk = $1
+             ORDER BY device.created_at DESC",
+        )
+        .bind(vehicle.0)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(devices))
     }
 
     pub async fn claim_device(

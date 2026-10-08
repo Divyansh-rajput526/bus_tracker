@@ -448,6 +448,23 @@ async fn rate_limits_are_bounded_by_ip_and_category() {
     );
 }
 
+#[test]
+fn coordinate_validation_and_admin_auth_checks() {
+    assert!(valid_coordinates(27.24, 77.84));
+    assert!(valid_coordinates(-90.0, -180.0));
+    assert!(valid_coordinates(90.0, 180.0));
+    assert!(!valid_coordinates(90.01, 77.84));
+    assert!(!valid_coordinates(-90.01, 77.84));
+    assert!(!valid_coordinates(27.24, 180.01));
+    assert!(!valid_coordinates(27.24, -180.01));
+    assert!(!valid_coordinates(f64::NAN, 77.84));
+    assert!(!valid_coordinates(27.24, f64::INFINITY));
+
+    let headers = HeaderMap::new();
+    let err = authorize_admin(&headers).unwrap_err();
+    assert!(err.0 == StatusCode::INTERNAL_SERVER_ERROR || err.0 == StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL to name a disposable PostgreSQL database"]
 async fn postgres_registration_authorization_and_telemetry_flow() {
@@ -553,6 +570,16 @@ async fn postgres_registration_authorization_and_telemetry_flow() {
         .await
         .unwrap();
 
+    let devices = database
+        .vehicle_devices("TEST-BUS-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, device_id);
+    assert_eq!(devices[0].device_label, "primary device");
+    assert_eq!(devices[0].status, "active");
+
     let assignment = get_device_assignment(
         State(AppState {
             database: database.clone(),
@@ -598,6 +625,23 @@ async fn postgres_registration_authorization_and_telemetry_flow() {
         .update_vehicle("TEST-BUS-3", "active", None)
         .await
         .unwrap();
+
+    let bus1_devices = database
+        .vehicle_devices("TEST-BUS-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let bus3_devices = database
+        .vehicle_devices("TEST-BUS-3")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus1_devices.len(), 1);
+    assert_eq!(bus1_devices[0].device_id, device_id);
+    assert_eq!(bus1_devices[0].status, "active");
+    assert_eq!(bus3_devices.len(), 1);
+    assert_eq!(bus3_devices[0].device_id, unassigned_device_id);
+    assert_eq!(bus3_devices[0].status, "active");
     let assignment = get_device_assignment(
         State(AppState {
             database: database.clone(),
@@ -843,6 +887,106 @@ async fn postgres_registration_authorization_and_telemetry_flow() {
         .await,
         Err(LocationWriteError::Unauthorized)
     ));
+
+    // Verify deletion of TEST-BUS-1 cleanly purges related data and does not impact TEST-BUS-2 or TEST-BUS-3
+    database.delete_vehicle("TEST-BUS-1").await.unwrap();
+    assert!(
+        database
+            .admin_vehicle("TEST-BUS-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Verify orphaned records count is 0 in all child tables
+    let orphan_states: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vehicle_current_state WHERE vehicle_pk NOT IN (SELECT vehicle_pk FROM vehicles)",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_states, 0);
+
+    let orphan_telemetry: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vehicle_telemetry WHERE vehicle_pk NOT IN (SELECT vehicle_pk FROM vehicles)",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_telemetry, 0);
+
+    let orphan_assignments: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vehicle_route_assignments WHERE vehicle_pk NOT IN (SELECT vehicle_pk FROM vehicles)",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_assignments, 0);
+
+    let orphan_devices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tracking_devices WHERE vehicle_pk NOT IN (SELECT vehicle_pk FROM vehicles)",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_devices, 0);
+
+    let orphan_credentials: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM device_credentials WHERE device_pk NOT IN (SELECT device_pk FROM tracking_devices)",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_credentials, 0);
+
+    // Verify TEST-BUS-2 and TEST-BUS-3 are completely unaffected
+    assert!(
+        database
+            .admin_vehicle("TEST-BUS-2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        database
+            .admin_vehicle("TEST-BUS-3")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let bus3_devices = database
+        .vehicle_devices("TEST-BUS-3")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus3_devices.len(), 1);
+
+    // Deleting a non-existent vehicle returns VehicleNotFound
+    assert!(matches!(
+        database.delete_vehicle("NON-EXISTENT-BUS").await,
+        Err(StoreError::VehicleNotFound)
+    ));
+
+    // Retired vehicles remain deletable
+    database
+        .update_vehicle("TEST-BUS-2", "retired", None)
+        .await
+        .unwrap();
+    database.delete_vehicle("TEST-BUS-2").await.unwrap();
+    assert!(
+        database
+            .admin_vehicle("TEST-BUS-2")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        database
+            .admin_vehicle("TEST-BUS-3")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     inspection_pool.close().await;
     database.close().await;

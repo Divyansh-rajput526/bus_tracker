@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 mod db;
 use db::{
-    AdminVehicle, CurrentVehicleState, Database, DeviceCredentialError, LocationWriteError,
-    StoreError,
+    AdminDevice, AdminVehicle, CurrentVehicleState, Database, DeviceCredentialError,
+    LocationWriteError, StoreError,
 };
 
 #[cfg(test)]
@@ -275,11 +275,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/vehicles", get(get_vehicles).post(create_vehicle))
         .route(
             "/admin/vehicles/{vehicle_id}",
-            get(get_vehicle).patch(update_vehicle),
+            get(get_vehicle)
+                .patch(update_vehicle)
+                .delete(delete_vehicle),
         )
         .route(
             "/admin/vehicles/{vehicle_id}/devices",
-            post(create_device_enrollment),
+            get(get_vehicle_devices).post(create_device_enrollment),
         )
         .route(
             "/admin/vehicles/{vehicle_id}/route-assignments",
@@ -681,6 +683,28 @@ async fn update_vehicle(
     }
 }
 
+async fn delete_vehicle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vehicle_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = vehicle_id.trim().to_uppercase();
+    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
+    }
+
+    match state.database.delete_vehicle(&vehicle_id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(StoreError::VehicleNotFound) => Err((StatusCode::NOT_FOUND, "Vehicle does not exist")),
+        Err(StoreError::Database(error)) => {
+            eprintln!("Vehicle deletion failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
 async fn assign_vehicle_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -716,6 +740,26 @@ async fn assign_vehicle_route(
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
         }
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error")),
+    }
+}
+
+async fn get_vehicle_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vehicle_id): Path<String>,
+) -> Result<Json<Vec<AdminDevice>>, (StatusCode, &'static str)> {
+    authorize_admin(&headers)?;
+    let vehicle_id = vehicle_id.trim().to_uppercase();
+    if vehicle_id.is_empty() || vehicle_id.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid vehicle ID"));
+    }
+    match state.database.vehicle_devices(&vehicle_id).await {
+        Ok(Some(devices)) => Ok(Json(devices)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "Vehicle does not exist")),
+        Err(error) => {
+            eprintln!("Vehicle devices query failed: {error}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"))
+        }
     }
 }
 
@@ -1191,6 +1235,7 @@ fn build_cors_layer() -> CorsLayer {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
