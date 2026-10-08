@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import 'data/api_client.dart';
 import 'data/device_session_store.dart';
+import 'data/foreground_location_service.dart';
+import 'data/tracking_controller.dart';
 import 'models/device_session.dart';
 import 'screens/assignment_screen.dart';
 import 'screens/device_enrollment_screen.dart';
@@ -11,10 +13,16 @@ void main() {
 }
 
 class DriverApp extends StatelessWidget {
-  const DriverApp({super.key, this.apiClient, this.sessionStore});
+  const DriverApp({
+    super.key,
+    this.apiClient,
+    this.sessionStore,
+    this.locationService,
+  });
 
   final ApiClient? apiClient;
   final DeviceSessionStore? sessionStore;
+  final ForegroundLocationService? locationService;
 
   @override
   Widget build(BuildContext context) {
@@ -26,22 +34,34 @@ class DriverApp extends StatelessWidget {
       home: _DriverHome(
         apiClient: apiClient ?? ApiClient(),
         sessionStore: sessionStore ?? SecureDeviceSessionStore(),
+        locationService:
+            locationService ?? const GeolocatorForegroundLocationService(),
       ),
     );
   }
 }
 
 class _DriverHome extends StatefulWidget {
-  const _DriverHome({required this.apiClient, required this.sessionStore});
+  const _DriverHome({
+    required this.apiClient,
+    required this.sessionStore,
+    required this.locationService,
+  });
 
   final ApiClient apiClient;
   final DeviceSessionStore sessionStore;
+  final ForegroundLocationService locationService;
 
   @override
   State<_DriverHome> createState() => _DriverHomeState();
 }
 
 class _DriverHomeState extends State<_DriverHome> {
+  late final TrackingController _trackingController = TrackingController(
+    locationService: widget.locationService,
+    apiClient: widget.apiClient,
+    onUnauthorized: _clearSession,
+  );
   DeviceSession? _session;
   bool _isLoading = true;
   bool _hasStorageError = false;
@@ -50,6 +70,12 @@ class _DriverHomeState extends State<_DriverHome> {
   void initState() {
     super.initState();
     _restoreSession();
+  }
+
+  @override
+  void dispose() {
+    _trackingController.dispose();
+    super.dispose();
   }
 
   Future<void> _restoreSession() async {
@@ -64,6 +90,7 @@ class _DriverHomeState extends State<_DriverHome> {
         _session = session;
         _isLoading = false;
       });
+      _trackingController.setSession(session);
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -76,10 +103,13 @@ class _DriverHomeState extends State<_DriverHome> {
   Future<void> _saveSession(DeviceSession session) async {
     await widget.sessionStore.write(session);
     if (!mounted) return;
+    _trackingController.setSession(session);
     setState(() => _session = session);
   }
 
   Future<void> _clearSession() async {
+    await _trackingController.stopTracking();
+    _trackingController.setSession(null);
     await widget.sessionStore.delete();
     if (!mounted) return;
     setState(() => _session = null);
@@ -122,6 +152,7 @@ class _DriverHomeState extends State<_DriverHome> {
       apiClient: widget.apiClient,
       session: session,
       onClearSession: _clearSession,
+      trackingController: _trackingController,
     );
   }
 }

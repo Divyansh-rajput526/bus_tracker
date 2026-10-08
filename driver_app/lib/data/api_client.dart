@@ -134,6 +134,7 @@ class ApiClient {
     required String routeId,
     required double latitude,
     required double longitude,
+    required double accuracyMeters,
     required DateTime deviceTimestamp,
   }) async {
     final response = await _post(
@@ -143,6 +144,7 @@ class ApiClient {
         'route_id': routeId,
         'latitude': latitude,
         'longitude': longitude,
+        'accuracy_meters': accuracyMeters,
         'device_timestamp': deviceTimestamp.toUtc().toIso8601String(),
       }),
       headers: {

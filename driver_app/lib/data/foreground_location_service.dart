@@ -35,6 +35,12 @@ abstract interface class ForegroundLocationService {
 class GeolocatorForegroundLocationService implements ForegroundLocationService {
   const GeolocatorForegroundLocationService();
 
+  static final AndroidSettings foregroundLocationSettings = AndroidSettings(
+    accuracy: LocationAccuracy.high,
+    distanceFilter: 0,
+    intervalDuration: const Duration(seconds: 2),
+  );
+
   @override
   Future<bool> isLocationServiceEnabled() =>
       Geolocator.isLocationServiceEnabled();
@@ -50,16 +56,13 @@ class GeolocatorForegroundLocationService implements ForegroundLocationService {
   @override
   Future<DriverLocation> getCurrentLocation() async => _mapPosition(
     await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      locationSettings: foregroundLocationSettings,
     ),
   );
 
   @override
   Stream<DriverLocation> getLocationUpdates() => Geolocator.getPositionStream(
-    locationSettings: const LocationSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 10,
-    ),
+    locationSettings: foregroundLocationSettings,
   ).map(_mapPosition);
 
   @override

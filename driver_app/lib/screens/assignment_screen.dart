@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 
 import '../data/api_client.dart';
-import '../data/foreground_location_service.dart';
+import '../data/tracking_controller.dart';
 import '../models/assignment.dart';
 import '../models/device_session.dart';
 import 'location_screen.dart';
+import '../widgets/tracking_toggle.dart';
 
 enum _AssignmentViewState {
   loading,
@@ -21,14 +22,14 @@ class AssignmentScreen extends StatefulWidget {
     super.key,
     required this.session,
     required this.onClearSession,
+    required this.trackingController,
     this.apiClient,
-    this.locationService,
   });
 
   final DeviceSession session;
   final Future<void> Function() onClearSession;
+  final TrackingController trackingController;
   final ApiClient? apiClient;
-  final ForegroundLocationService? locationService;
 
   @override
   State<AssignmentScreen> createState() => _AssignmentScreenState();
@@ -70,6 +71,7 @@ class _AssignmentScreenState extends State<AssignmentScreen> {
             ? _AssignmentViewState.noAssignment
             : _AssignmentViewState.assigned;
       });
+      widget.trackingController.setAssignment(assignment);
     } on DeviceAssignmentHttpException catch (error) {
       if (error.statusCode == 401) {
         try {
@@ -152,8 +154,8 @@ class _AssignmentScreenState extends State<AssignmentScreen> {
   Widget build(BuildContext context) {
     final content = switch (_viewState) {
       _AssignmentViewState.loading => _buildLoading(),
-      _AssignmentViewState.assigned || _AssignmentViewState.noAssignment =>
-        _buildAssignment(),
+      _AssignmentViewState.assigned ||
+      _AssignmentViewState.noAssignment => _buildAssignment(),
       _ => _buildFailure(),
     };
 
@@ -202,19 +204,17 @@ class _AssignmentScreenState extends State<AssignmentScreen> {
           value: assignment.routeId ?? 'No route assigned',
         ),
         const SizedBox(height: 32),
+        TrackingToggle(controller: widget.trackingController),
+        const SizedBox(height: 12),
         OutlinedButton.icon(
           onPressed: () => Navigator.of(context).push(
             MaterialPageRoute<void>(
-              builder: (_) => LocationScreen(
-                locationService: widget.locationService,
-                apiClient: _apiClient,
-                session: widget.session,
-                onUnauthorized: widget.onClearSession,
-              ),
+              builder: (_) =>
+                  LocationScreen(trackingController: widget.trackingController),
             ),
           ),
           icon: const Icon(Icons.my_location),
-          label: const Text('View GPS location'),
+          label: const Text('Location Tracking Details'),
         ),
         const SizedBox(height: 12),
         OutlinedButton.icon(
@@ -243,11 +243,7 @@ class _AssignmentScreenState extends State<AssignmentScreen> {
         Icons.lock_outline,
         'Needs attention',
       ),
-      _ => (
-        'Could not load assignment',
-        Icons.error_outline,
-        'Unavailable',
-      ),
+      _ => ('Could not load assignment', Icons.error_outline, 'Unavailable'),
     };
 
     return Center(

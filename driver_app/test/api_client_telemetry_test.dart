@@ -30,6 +30,7 @@ void main() {
           'route_id': 'R17',
           'latitude': 51.5074,
           'longitude': -0.1278,
+          'accuracy_meters': 5.2,
           'device_timestamp': '2026-10-05T12:13:14.000Z',
         });
         return http.Response('Location updated', 200);
@@ -42,6 +43,7 @@ void main() {
         routeId: 'R17',
         latitude: 51.5074,
         longitude: -0.1278,
+        accuracyMeters: 5.2,
         deviceTimestamp: timestamp,
       );
     },
@@ -59,6 +61,7 @@ void main() {
       routeId: 'R17',
       latitude: 51.5074,
       longitude: -0.1278,
+      accuracyMeters: 5.2,
       deviceTimestamp: DateTime.utc(2026, 10, 5),
     );
   });
@@ -148,6 +151,7 @@ void main() {
           'route_id': 'assigned-route-from-server',
           'latitude': 1.0,
           'longitude': 2.0,
+          'accuracy_meters': 5.2,
           'device_timestamp': '2026-10-05T12:13:14.000Z',
         });
         return http.Response('Location updated', 200);
@@ -161,6 +165,7 @@ void main() {
         routeId: assignment.routeId!,
         latitude: 1,
         longitude: 2,
+        accuracyMeters: 5.2,
         deviceTimestamp: DateTime.utc(2026, 10, 5, 12, 13, 14),
       );
     },
@@ -179,5 +184,6 @@ Future<void> _sendLocation(ApiClient client) => client.sendLocationUpdate(
   routeId: 'R17',
   latitude: 51.5074,
   longitude: -0.1278,
+  accuracyMeters: 5.2,
   deviceTimestamp: DateTime.utc(2026, 10, 5, 12, 13, 14),
 );

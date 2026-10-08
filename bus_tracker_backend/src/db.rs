@@ -3,7 +3,7 @@ use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::{Route, Stop, VehicleLocation};
+use crate::{MovementAnchor, Route, SpeedCalculation, Stop, VehicleLocation};
 
 #[derive(Clone)]
 pub struct Database {
@@ -15,8 +15,24 @@ pub struct CurrentVehicleState {
     pub route_id: String,
     pub latitude: f64,
     pub longitude: f64,
+    pub accuracy_meters: Option<f64>,
     pub speed_kmh: f64,
     pub device_timestamp: DateTime<Utc>,
+    pub movement_latitude: f64,
+    pub movement_longitude: f64,
+    pub movement_accuracy_meters: Option<f64>,
+    pub movement_device_timestamp: DateTime<Utc>,
+}
+
+impl CurrentVehicleState {
+    pub fn movement_anchor(&self) -> MovementAnchor {
+        MovementAnchor {
+            latitude: self.movement_latitude,
+            longitude: self.movement_longitude,
+            accuracy_meters: self.movement_accuracy_meters,
+            device_timestamp: self.movement_device_timestamp,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -169,12 +185,13 @@ impl Database {
         route_id: &str,
         latitude: f64,
         longitude: f64,
+        accuracy_meters: f64,
         device_timestamp: DateTime<Utc>,
         server_timestamp: DateTime<Utc>,
         calculate_speed: F,
     ) -> Result<bool, LocationWriteError<E>>
     where
-        F: FnOnce(Option<&CurrentVehicleState>) -> Result<Option<f64>, E>,
+        F: FnOnce(Option<&CurrentVehicleState>) -> Result<Option<SpeedCalculation>, E>,
     {
         let mut transaction = self
             .pool
@@ -252,7 +269,9 @@ impl Database {
 
         let previous = sqlx::query_as::<_, CurrentVehicleState>(
             "SELECT route.route_id, state.latitude, state.longitude,
-                    state.speed_kmh, state.device_timestamp
+                    state.accuracy_meters, state.speed_kmh, state.device_timestamp,
+                    state.movement_latitude, state.movement_longitude,
+                    state.movement_accuracy_meters, state.movement_device_timestamp
              FROM vehicle_current_state AS state
              JOIN routes AS route ON route.route_pk = state.route_pk
                          WHERE state.vehicle_pk = $1
@@ -281,7 +300,8 @@ impl Database {
             }
         }
 
-        let Some(speed) = calculate_speed(previous.as_ref()).map_err(LocationWriteError::Domain)?
+        let Some(calculation) =
+            calculate_speed(previous.as_ref()).map_err(LocationWriteError::Domain)?
         else {
             transaction
                 .rollback()
@@ -289,6 +309,8 @@ impl Database {
                 .map_err(LocationWriteError::Database)?;
             return Ok(false);
         };
+        let speed = calculation.speed_kmh;
+        let movement_anchor = calculation.movement_anchor;
 
         sqlx::query("UPDATE device_credentials SET last_used_at = $2 WHERE credential_id = $1")
             .bind(credential_id)
@@ -305,14 +327,16 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO vehicle_telemetry
-                 (vehicle_pk, device_pk, route_pk, latitude, longitude, speed_kmh, device_timestamp, server_timestamp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 (vehicle_pk, device_pk, route_pk, latitude, longitude, accuracy_meters,
+                  speed_kmh, device_timestamp, server_timestamp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(vehicle_pk)
         .bind(device_pk)
         .bind(route_pk)
         .bind(latitude)
         .bind(longitude)
+        .bind(accuracy_meters)
         .bind(speed)
         .bind(device_timestamp)
         .bind(server_timestamp)
@@ -322,25 +346,37 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO vehicle_current_state
-                 (vehicle_pk, last_device_pk, route_pk, latitude, longitude, speed_kmh, device_timestamp, server_timestamp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 (vehicle_pk, last_device_pk, route_pk, latitude, longitude, accuracy_meters,
+                  speed_kmh, device_timestamp, server_timestamp, movement_latitude,
+                  movement_longitude, movement_accuracy_meters, movement_device_timestamp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (vehicle_pk) DO UPDATE SET
                  last_device_pk = EXCLUDED.last_device_pk,
                  route_pk = EXCLUDED.route_pk,
                  latitude = EXCLUDED.latitude,
                  longitude = EXCLUDED.longitude,
+                 accuracy_meters = EXCLUDED.accuracy_meters,
                  speed_kmh = EXCLUDED.speed_kmh,
                  device_timestamp = EXCLUDED.device_timestamp,
-                 server_timestamp = EXCLUDED.server_timestamp",
+                 server_timestamp = EXCLUDED.server_timestamp,
+                 movement_latitude = EXCLUDED.movement_latitude,
+                 movement_longitude = EXCLUDED.movement_longitude,
+                 movement_accuracy_meters = EXCLUDED.movement_accuracy_meters,
+                 movement_device_timestamp = EXCLUDED.movement_device_timestamp",
         )
         .bind(vehicle_pk)
         .bind(device_pk)
         .bind(route_pk)
         .bind(latitude)
         .bind(longitude)
+        .bind(accuracy_meters)
         .bind(speed)
         .bind(device_timestamp)
         .bind(server_timestamp)
+        .bind(movement_anchor.latitude)
+        .bind(movement_anchor.longitude)
+        .bind(movement_anchor.accuracy_meters)
+        .bind(movement_anchor.device_timestamp)
         .execute(&mut *transaction)
         .await
         .map_err(LocationWriteError::Database)?;

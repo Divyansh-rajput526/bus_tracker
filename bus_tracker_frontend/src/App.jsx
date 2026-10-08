@@ -12,6 +12,11 @@ import markerIcon from "leaflet/dist/images/marker-icon.png";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import "leaflet/dist/leaflet.css";
+import {
+  calculateApproximateEtaMinutes,
+  formatVehicleSpeed,
+  getDisplaySpeed,
+} from "./vehiclePresentation.js";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL?.trim() || "http://localhost:8080";
@@ -180,105 +185,6 @@ function getStatusColor(status) {
 function normalizeRouteKey(value) {
   return String(value ?? "").trim().toUpperCase();
 }
-
-function haversineDistanceKm(
-  latitude1,
-  longitude1,
-  latitude2,
-  longitude2
-) {
-  const earthRadiusKm = 6371;
-
-  const toRadians = (value) =>
-    (value * Math.PI) / 180;
-
-  const dLatitude = toRadians(
-    latitude2 - latitude1
-  );
-
-  const dLongitude = toRadians(
-    longitude2 - longitude1
-  );
-
-  const lat1 = toRadians(latitude1);
-  const lat2 = toRadians(latitude2);
-
-  const a =
-    Math.sin(dLatitude / 2) ** 2 +
-    Math.cos(lat1) *
-      Math.cos(lat2) *
-      Math.sin(dLongitude / 2) ** 2;
-
-  const c =
-    2 *
-    Math.atan2(
-      Math.sqrt(a),
-      Math.sqrt(1 - a)
-    );
-
-  return earthRadiusKm * c;
-}
-
-
-function calculateApproximateEtaMinutes(
-  vehicle,
-  stop
-) {
-  if (!vehicle || !stop) {
-    return null;
-  }
-
-  const vehicleLatitude = Number(
-    vehicle.latitude
-  );
-
-  const vehicleLongitude = Number(
-    vehicle.longitude
-  );
-
-  const stopLatitude = Number(stop.latitude);
-  const stopLongitude = Number(stop.longitude);
-
-  const speed = Number(vehicle.speed);
-
-  if (
-    !Number.isFinite(vehicleLatitude) ||
-    !Number.isFinite(vehicleLongitude) ||
-    !Number.isFinite(stopLatitude) ||
-    !Number.isFinite(stopLongitude) ||
-    !Number.isFinite(speed)
-  ) {
-    return null;
-  }
-
-  /*
-   * Do not display a meaningful ETA when the vehicle is
-   * essentially stationary.
-   */
-  if (speed < 2) {
-    return null;
-  }
-
-  const distanceKm = haversineDistanceKm(
-    vehicleLatitude,
-    vehicleLongitude,
-    stopLatitude,
-    stopLongitude
-  );
-
-  const hours = distanceKm / speed;
-  const minutes = hours * 60;
-
-  if (!Number.isFinite(minutes)) {
-    return null;
-  }
-
-  return {
-    minutes: Math.max(0, minutes),
-    distanceKm,
-  };
-}
-
 
 function markProgrammaticMove(ref, durationMs = 1200) {
   ref.current = Math.max(ref.current, Date.now() + durationMs);
@@ -1239,16 +1145,6 @@ export default function App() {
    * =======================================================
    */
 
-  const selectedSpeed =
-    Number(
-      selectedVehicle?.speed
-    );
-
-  const hasValidSpeed =
-    Number.isFinite(
-      selectedSpeed
-    );
-
   const selectedVehicleStatus =
     selectedVehicle
       ? getVehicleStatus(
@@ -1256,6 +1152,12 @@ export default function App() {
           now
         )
       : null;
+
+  const selectedSpeed = getDisplaySpeed(
+    selectedVehicleStatus,
+    selectedVehicle?.speed
+  );
+  const selectedSpeedDisplay = formatVehicleSpeed(selectedSpeed);
 
   const selectedVehicleLastUpdate =
     selectedVehicle
@@ -1265,18 +1167,14 @@ export default function App() {
         )
       : null;
 
-  const etaData =
-    selectedVehicle &&
-    selectedStop &&
-    (selectedVehicleStatus === "Active" ||
-      selectedVehicleStatus === "Stale")
-      ? calculateApproximateEtaMinutes(
-          selectedVehicle,
-          selectedStop
-        )
-      : null;
+  const etaData = calculateApproximateEtaMinutes(
+    selectedVehicle,
+    selectedStop,
+    selectedVehicleStatus
+  );
 
   const etaUnavailableMessage =
+    selectedVehicleStatus === "Stale" ||
     selectedVehicleStatus === "Offline" ||
     selectedVehicleStatus === "Unknown"
       ? "ETA unavailable because the vehicle data is not current."
@@ -1880,10 +1778,10 @@ export default function App() {
                 String(vehicle.vehicle_id) ===
                 String(selectedVehicleId);
 
-              const vehicleSpeed =
-                Number(
-                  vehicle.speed
-                );
+              const vehicleSpeed = getDisplaySpeed(
+                status,
+                vehicle.speed
+              );
 
               return (
                 <Marker
@@ -1943,13 +1841,7 @@ export default function App() {
                         <strong>
                           Speed:
                         </strong>{" "}
-                        {Number.isFinite(
-                          vehicleSpeed
-                        )
-                          ? `${vehicleSpeed.toFixed(
-                              1
-                            )} km/h`
-                          : "Unavailable"}
+                        {formatVehicleSpeed(vehicleSpeed)}
                       </div>
 
                       <div>
@@ -2150,10 +2042,10 @@ export default function App() {
                           now
                         );
 
-                      const speed =
-                        Number(
-                          vehicle.speed
-                        );
+                      const speed = getDisplaySpeed(
+                        status,
+                        vehicle.speed
+                      );
 
                       const isSelected =
                         String(vehicle.vehicle_id) ===
@@ -2186,13 +2078,7 @@ export default function App() {
 
                           <div className="vehicle-card-meta">
                             Speed:{" "}
-                            {Number.isFinite(
-                              speed
-                            )
-                              ? `${speed.toFixed(
-                                  1
-                                )} km/h`
-                              : "Unavailable"}
+                            {formatVehicleSpeed(speed)}
                           </div>
 
                           <div className="vehicle-card-meta">
@@ -2441,11 +2327,7 @@ export default function App() {
               </span>
 
               <span className="info-value">
-                {hasValidSpeed
-                  ? `${selectedSpeed.toFixed(
-                      1
-                    )} km/h`
-                  : "Unavailable"}
+                {selectedSpeedDisplay}
               </span>
             </div>
 

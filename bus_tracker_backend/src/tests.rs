@@ -7,8 +7,65 @@ fn test_update(vehicle_id: &str, route_id: &str, timestamp: DateTime<Utc>) -> Lo
         route_id: route_id.to_string(),
         latitude: 27.24,
         longitude: 77.84,
+        accuracy_meters: 5.0,
         device_timestamp: timestamp,
     }
+}
+
+fn location_update_at(
+    route_id: &str,
+    timestamp: DateTime<Utc>,
+    latitude: f64,
+    accuracy_meters: f64,
+) -> LocationUpdate {
+    LocationUpdate {
+        vehicle_id: "BUS-1".to_string(),
+        route_id: route_id.to_string(),
+        latitude,
+        longitude: 77.84,
+        accuracy_meters,
+        device_timestamp: timestamp,
+    }
+}
+
+fn speed_state(
+    route_id: &str,
+    latest_latitude: f64,
+    latest_accuracy_meters: Option<f64>,
+    latest_timestamp: DateTime<Utc>,
+    speed_kmh: f64,
+    movement_latitude: f64,
+    movement_accuracy_meters: Option<f64>,
+    movement_timestamp: DateTime<Utc>,
+) -> CurrentVehicleState {
+    CurrentVehicleState {
+        route_id: route_id.to_string(),
+        latitude: latest_latitude,
+        longitude: 77.84,
+        accuracy_meters: latest_accuracy_meters,
+        speed_kmh,
+        device_timestamp: latest_timestamp,
+        movement_latitude,
+        movement_longitude: 77.84,
+        movement_accuracy_meters,
+        movement_device_timestamp: movement_timestamp,
+    }
+}
+
+fn state_after_calculation(
+    payload: &LocationUpdate,
+    calculation: &SpeedCalculation,
+) -> CurrentVehicleState {
+    speed_state(
+        &payload.route_id,
+        payload.latitude,
+        Some(payload.accuracy_meters),
+        payload.device_timestamp,
+        calculation.speed_kmh,
+        calculation.movement_anchor.latitude,
+        calculation.movement_anchor.accuracy_meters,
+        calculation.movement_anchor.device_timestamp,
+    )
 }
 
 async fn write_update(
@@ -28,6 +85,7 @@ async fn write_update(
             &route_id,
             payload.latitude,
             payload.longitude,
+            payload.accuracy_meters,
             payload.device_timestamp,
             server_timestamp,
             |previous| {
@@ -36,6 +94,218 @@ async fn write_update(
             },
         )
         .await
+}
+
+fn meters_to_latitude_degrees(meters: f64) -> f64 {
+    meters / 111_195.0
+}
+
+#[test]
+fn accuracy_aware_speed_filter_ignores_stationary_jitter() {
+    let timestamp = Utc::now();
+    let previous = speed_state(
+        "R01",
+        27.24,
+        Some(5.0),
+        timestamp,
+        0.0,
+        27.24,
+        Some(5.0),
+        timestamp,
+    );
+    let jittered = location_update_at(
+        "R01",
+        timestamp + chrono::Duration::seconds(5),
+        27.24 + meters_to_latitude_degrees(4.0),
+        5.0,
+    );
+
+    let calculation = calculate_speed(Some(&previous), "R01", &jittered)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(calculation.speed_kmh, 0.0);
+    assert_eq!(calculation.movement_anchor.latitude, 27.24);
+    assert_eq!(calculation.movement_anchor.device_timestamp, timestamp);
+}
+
+#[test]
+fn accuracy_aware_speed_filter_calculates_significant_movement() {
+    let timestamp = Utc::now();
+    let previous = speed_state(
+        "R01",
+        27.24,
+        Some(5.0),
+        timestamp,
+        0.0,
+        27.24,
+        Some(5.0),
+        timestamp,
+    );
+    let moved = location_update_at(
+        "R01",
+        timestamp + chrono::Duration::seconds(10),
+        27.24 + meters_to_latitude_degrees(100.0),
+        5.0,
+    );
+
+    let calculation = calculate_speed(Some(&previous), "R01", &moved)
+        .unwrap()
+        .unwrap();
+
+    assert!((calculation.speed_kmh - 12.6).abs() < 0.2);
+    assert_eq!(calculation.movement_anchor.latitude, moved.latitude);
+    assert_eq!(
+        calculation.movement_anchor.device_timestamp,
+        moved.device_timestamp
+    );
+}
+
+#[test]
+fn slow_movement_accumulates_across_noisy_fixes() {
+    let timestamp = Utc::now();
+    let mut previous = speed_state(
+        "R01",
+        27.24,
+        Some(5.0),
+        timestamp,
+        0.0,
+        27.24,
+        Some(5.0),
+        timestamp,
+    );
+    let mut latest_calculation = None;
+
+    for (seconds, distance_meters) in [(5, 5.0), (10, 10.0), (15, 15.0)] {
+        let payload = location_update_at(
+            "R01",
+            timestamp + chrono::Duration::seconds(seconds),
+            27.24 + meters_to_latitude_degrees(distance_meters),
+            5.0,
+        );
+        let calculation = calculate_speed(Some(&previous), "R01", &payload)
+            .unwrap()
+            .unwrap();
+        previous = state_after_calculation(&payload, &calculation);
+        latest_calculation = Some(calculation);
+    }
+
+    let calculation = latest_calculation.unwrap();
+    assert!(calculation.speed_kmh > 0.0);
+    assert!((calculation.speed_kmh - 1.26).abs() < 0.2);
+    assert_eq!(
+        calculation.movement_anchor.device_timestamp,
+        timestamp + chrono::Duration::seconds(15)
+    );
+}
+
+#[test]
+fn poor_accuracy_does_not_turn_noise_into_a_large_speed() {
+    let timestamp = Utc::now();
+    let previous = speed_state(
+        "R01",
+        27.24,
+        Some(100.0),
+        timestamp,
+        0.0,
+        27.24,
+        Some(100.0),
+        timestamp,
+    );
+    let noisy = location_update_at(
+        "R01",
+        timestamp + chrono::Duration::seconds(1),
+        27.24 + meters_to_latitude_degrees(100.0),
+        100.0,
+    );
+
+    let calculation = calculate_speed(Some(&previous), "R01", &noisy)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(calculation.speed_kmh, 0.0);
+    assert_eq!(calculation.movement_anchor.latitude, 27.24);
+}
+
+#[test]
+fn route_change_resets_speed_and_movement_anchor() {
+    let timestamp = Utc::now();
+    let previous = speed_state(
+        "R01",
+        27.24,
+        Some(5.0),
+        timestamp,
+        30.0,
+        27.24,
+        Some(5.0),
+        timestamp,
+    );
+    let changed_route =
+        location_update_at("R02", timestamp + chrono::Duration::seconds(5), 27.25, 5.0);
+
+    let calculation = calculate_speed(Some(&previous), "R02", &changed_route)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(calculation.speed_kmh, 0.0);
+    assert_eq!(calculation.movement_anchor.latitude, changed_route.latitude);
+    assert_eq!(
+        calculation.movement_anchor.device_timestamp,
+        changed_route.device_timestamp
+    );
+}
+
+#[test]
+fn speed_interval_safeguards_are_preserved() {
+    let timestamp = Utc::now();
+    let previous = speed_state(
+        "R01",
+        27.24,
+        Some(5.0),
+        timestamp,
+        20.0,
+        27.24,
+        Some(5.0),
+        timestamp,
+    );
+    let too_soon = location_update_at(
+        "R01",
+        timestamp + chrono::Duration::milliseconds(MIN_SPEED_INTERVAL_MILLISECONDS - 1),
+        27.25,
+        5.0,
+    );
+    let short_result = calculate_speed(Some(&previous), "R01", &too_soon)
+        .unwrap()
+        .unwrap();
+    assert_eq!(short_result.speed_kmh, 20.0);
+    assert_eq!(short_result.movement_anchor.latitude, 27.24);
+
+    let too_late = location_update_at(
+        "R01",
+        timestamp + chrono::Duration::seconds(MAX_SPEED_INTERVAL_SECONDS + 1),
+        27.25,
+        5.0,
+    );
+    let long_result = calculate_speed(Some(&previous), "R01", &too_late)
+        .unwrap()
+        .unwrap();
+    assert_eq!(long_result.speed_kmh, 0.0);
+    assert_eq!(long_result.movement_anchor.latitude, too_late.latitude);
+
+    let excessive_speed = location_update_at(
+        "R01",
+        timestamp + chrono::Duration::seconds(1),
+        27.24 + meters_to_latitude_degrees(1000.0),
+        1.0,
+    );
+    let excessive_result = calculate_speed(Some(&previous), "R01", &excessive_speed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(excessive_result.speed_kmh, 20.0);
+    assert_eq!(
+        excessive_result.movement_anchor.latitude,
+        excessive_speed.latitude
+    );
 }
 
 async fn issue_test_device(
@@ -118,7 +388,7 @@ fn device_credential_parser_and_timestamp_validation() {
 
     let invalid_coordinates = LocationUpdate {
         latitude: f64::NAN,
-        ..valid
+        ..valid.clone()
     };
     assert_eq!(
         validate_location_update("BUS-1", "R01", &invalid_coordinates, now)
@@ -126,6 +396,41 @@ fn device_credential_parser_and_timestamp_validation() {
             .1,
         "Invalid coordinates"
     );
+
+    let invalid_accuracy = LocationUpdate {
+        accuracy_meters: f64::NAN,
+        ..valid.clone()
+    };
+    assert_eq!(
+        validate_location_update("BUS-1", "R01", &invalid_accuracy, now)
+            .unwrap_err()
+            .1,
+        "Invalid GPS accuracy"
+    );
+
+    for accuracy_meters in [-1.0, MAX_GPS_ACCURACY_METERS + 1.0, f64::INFINITY] {
+        let invalid_accuracy = LocationUpdate {
+            accuracy_meters,
+            ..valid.clone()
+        };
+        assert_eq!(
+            validate_location_update("BUS-1", "R01", &invalid_accuracy, now)
+                .unwrap_err()
+                .1,
+            "Invalid GPS accuracy"
+        );
+    }
+
+    let accepted_accuracy = serde_json::from_value::<LocationUpdate>(serde_json::json!({
+        "vehicle_id": "BUS-1",
+        "route_id": "R01",
+        "latitude": 27.24,
+        "longitude": 77.84,
+        "accuracy_meters": 4.75,
+        "device_timestamp": now,
+    }))
+    .unwrap();
+    assert_eq!(accepted_accuracy.accuracy_meters, 4.75);
 }
 
 #[tokio::test]
@@ -399,6 +704,26 @@ async fn postgres_registration_authorization_and_telemetry_flow() {
     let locations = database.locations().await.unwrap();
     assert_eq!(locations[0].route_id, "R02");
     assert_eq!(locations[0].speed, 0.0);
+    let (telemetry_accuracy, current_accuracy, movement_accuracy): (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    ) = sqlx::query_as(
+        "SELECT telemetry.accuracy_meters, state.accuracy_meters,
+                state.movement_accuracy_meters
+         FROM vehicle_telemetry AS telemetry
+         JOIN vehicle_current_state AS state ON state.vehicle_pk = telemetry.vehicle_pk
+         WHERE telemetry.vehicle_pk = (
+             SELECT vehicle_pk FROM vehicles WHERE vehicle_id = 'TEST-BUS-1'
+         )
+         ORDER BY telemetry.telemetry_id DESC LIMIT 1",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .unwrap();
+    assert_eq!(telemetry_accuracy, Some(5.0));
+    assert_eq!(current_accuracy, Some(5.0));
+    assert_eq!(movement_accuracy, Some(5.0));
 
     let before_state: DateTime<Utc> = sqlx::query_scalar(
         "SELECT server_timestamp FROM vehicle_current_state

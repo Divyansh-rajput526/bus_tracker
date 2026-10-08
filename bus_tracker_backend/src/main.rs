@@ -39,18 +39,23 @@ const MIN_SPEED_INTERVAL_MILLISECONDS: i64 = 250;
 const MAX_SPEED_INTERVAL_SECONDS: i64 = 120;
 const MAX_REASONABLE_SPEED_KMH: f64 = 180.0;
 const SPEED_SMOOTHING_ALPHA: f64 = 0.35;
+// A reported uncertainty radius above 100 km is unusable for vehicle telemetry.
+const MAX_GPS_ACCURACY_METERS: f64 = 100_000.0;
+// Require movement to exceed twice the root-sum-square of both uncertainty radii.
+const GPS_UNCERTAINTY_MULTIPLIER: f64 = 2.0;
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 // ========================================================
 // Incoming vehicle telemetry
 // ========================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct LocationUpdate {
     vehicle_id: String,
     route_id: String,
     latitude: f64,
     longitude: f64,
+    accuracy_meters: f64,
 
     // Time when the GPS measurement was taken.
     // Used for speed calculation only.
@@ -74,6 +79,20 @@ struct VehicleLocation {
 
     // Server-authoritative timestamp.
     timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MovementAnchor {
+    pub(crate) latitude: f64,
+    pub(crate) longitude: f64,
+    pub(crate) accuracy_meters: Option<f64>,
+    pub(crate) device_timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SpeedCalculation {
+    pub(crate) speed_kmh: f64,
+    pub(crate) movement_anchor: MovementAnchor,
 }
 
 // ========================================================
@@ -332,6 +351,7 @@ async fn update_location(
             &route_id,
             payload.latitude,
             payload.longitude,
+            payload.accuracy_meters,
             payload.device_timestamp,
             server_timestamp,
             |previous| {
@@ -381,6 +401,11 @@ fn validate_location_update(
     {
         return Err((StatusCode::BAD_REQUEST, "Invalid coordinates"));
     }
+    if !payload.accuracy_meters.is_finite()
+        || !(0.0..=MAX_GPS_ACCURACY_METERS).contains(&payload.accuracy_meters)
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid GPS accuracy"));
+    }
     let latest_allowed_device_time =
         server_timestamp + chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS);
     if payload.device_timestamp > latest_allowed_device_time {
@@ -401,9 +426,18 @@ fn calculate_speed(
     previous: Option<&CurrentVehicleState>,
     route_id: &str,
     payload: &LocationUpdate,
-) -> Result<Option<f64>, (StatusCode, &'static str)> {
+) -> Result<Option<SpeedCalculation>, (StatusCode, &'static str)> {
+    let current_anchor = || MovementAnchor {
+        latitude: payload.latitude,
+        longitude: payload.longitude,
+        accuracy_meters: Some(payload.accuracy_meters),
+        device_timestamp: payload.device_timestamp,
+    };
     let Some(previous) = previous else {
-        return Ok(Some(0.0));
+        return Ok(Some(SpeedCalculation {
+            speed_kmh: 0.0,
+            movement_anchor: current_anchor(),
+        }));
     };
 
     if payload.device_timestamp == previous.device_timestamp {
@@ -424,44 +458,82 @@ fn calculate_speed(
     }
 
     if previous.route_id != route_id {
-        return Ok(Some(0.0));
+        return Ok(Some(SpeedCalculation {
+            speed_kmh: 0.0,
+            movement_anchor: current_anchor(),
+        }));
     }
 
-    let elapsed_duration = payload
+    let sample_elapsed_seconds = payload
         .device_timestamp
         .signed_duration_since(previous.device_timestamp);
-    let elapsed_seconds = elapsed_duration
+    let sample_elapsed_seconds = sample_elapsed_seconds
         .to_std()
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid device timestamp interval"))?
         .as_secs_f64();
 
+    if sample_elapsed_seconds <= 0.0 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid device timestamp interval"));
+    }
+    if sample_elapsed_seconds < (MIN_SPEED_INTERVAL_MILLISECONDS as f64 / 1000.0) {
+        return Ok(Some(SpeedCalculation {
+            speed_kmh: previous.speed_kmh,
+            movement_anchor: previous.movement_anchor(),
+        }));
+    }
+
+    let elapsed_seconds = payload
+        .device_timestamp
+        .signed_duration_since(previous.movement_device_timestamp)
+        .to_std()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid device timestamp interval"))?
+        .as_secs_f64();
     if elapsed_seconds <= 0.0 {
         return Err((StatusCode::BAD_REQUEST, "Invalid device timestamp interval"));
     }
-    if elapsed_seconds < (MIN_SPEED_INTERVAL_MILLISECONDS as f64 / 1000.0) {
-        return Ok(Some(previous.speed_kmh));
-    }
     if elapsed_seconds > MAX_SPEED_INTERVAL_SECONDS as f64 {
-        return Ok(Some(0.0));
+        return Ok(Some(SpeedCalculation {
+            speed_kmh: 0.0,
+            movement_anchor: current_anchor(),
+        }));
     }
 
     let distance_km = haversine_distance_km(
-        previous.latitude,
-        previous.longitude,
+        previous.movement_latitude,
+        previous.movement_longitude,
         payload.latitude,
         payload.longitude,
     );
+    let previous_accuracy = previous
+        .movement_accuracy_meters
+        .or(previous.accuracy_meters)
+        .unwrap_or(payload.accuracy_meters);
+    let combined_uncertainty_meters = GPS_UNCERTAINTY_MULTIPLIER
+        * (previous_accuracy.powi(2) + payload.accuracy_meters.powi(2)).sqrt();
+    let distance_meters = distance_km * 1000.0;
+    if distance_meters <= combined_uncertainty_meters {
+        return Ok(Some(SpeedCalculation {
+            speed_kmh: previous.speed_kmh,
+            movement_anchor: previous.movement_anchor(),
+        }));
+    }
+
     let raw_speed = distance_km / (elapsed_seconds / 3600.0);
     if !raw_speed.is_finite() {
         return Err((StatusCode::BAD_REQUEST, "Unable to calculate speed"));
     }
     if raw_speed > MAX_REASONABLE_SPEED_KMH {
-        return Ok(Some(previous.speed_kmh));
+        return Ok(Some(SpeedCalculation {
+            speed_kmh: previous.speed_kmh,
+            movement_anchor: current_anchor(),
+        }));
     }
 
-    Ok(Some(
-        SPEED_SMOOTHING_ALPHA * raw_speed + (1.0 - SPEED_SMOOTHING_ALPHA) * previous.speed_kmh,
-    ))
+    Ok(Some(SpeedCalculation {
+        speed_kmh: SPEED_SMOOTHING_ALPHA * raw_speed
+            + (1.0 - SPEED_SMOOTHING_ALPHA) * previous.speed_kmh,
+        movement_anchor: current_anchor(),
+    }))
 }
 
 // ========================================================
